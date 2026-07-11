@@ -1,0 +1,12 @@
+import { ArrowDown, ArrowUp, ArrowUpDown } from 'lucide-react';
+import type { DataSourceMetadata, Team } from '../types/domain';
+import { DataQualityBadge, EmptyState } from './Core';
+
+export interface ComparisonRow { id: string; label: string; home: number | null; away: number | null; competitionAverage?: number | null; difference?: number | null; sampleSize?: number; format?: 'number' | 'percent'; metadata: DataSourceMetadata; hint?: string; }
+export interface ComparisonTableProps { homeTeam: Team; awayTeam: Team; rows: ComparisonRow[]; sort?: { key: 'label'|'home'|'away'; direction: 'asc'|'desc' }; onSort?: (key: 'label'|'home'|'away') => void; }
+export function ComparisonTable({ homeTeam, awayTeam, rows, sort, onSort }: ComparisonTableProps) {
+  if (!rows.length) return <EmptyState message="Ingen sammenlignbare målinger finnes for dette utvalget."/>;
+  const heading = (key: 'label'|'home'|'away', label: string) => <button className="sort-button" onClick={() => onSort?.(key)} disabled={!onSort}>{label}{sort?.key === key ? sort.direction === 'asc' ? <ArrowUp size={13}/> : <ArrowDown size={13}/> : <ArrowUpDown size={13}/>}</button>;
+  return <div className="table-shell"><table className="data-table comparison-table"><thead><tr><th>{heading('label','Måling')}</th><th>{heading('home',homeTeam.shortName)}</th><th>{heading('away',awayTeam.shortName)}</th><th>Turn.snitt</th><th>Differanse</th><th>Datagrunnlag</th><th>Kvalitet</th></tr></thead><tbody>{rows.map(row => <tr key={row.id}><th scope="row"><span>{row.label}</span>{row.hint && <small>{row.hint}</small>}</th><td><Metric value={row.home} format={row.format}/></td><td><Metric value={row.away} format={row.format}/></td><td><Metric value={row.competitionAverage} format={row.format}/></td><td><Metric value={row.difference ?? (row.home != null && row.away != null ? row.home-row.away : null)} format={row.format}/></td><td>{row.sampleSize ?? row.metadata.sampleSize} kamper</td><td><DataQualityBadge quality={row.metadata.quality}/></td></tr>)}</tbody></table></div>;
+}
+export function Metric({ value, format = 'number' }: { value: number | null | undefined; format?: 'number'|'percent' }) { return value == null ? <span className="missing" aria-label="Data mangler">—</span> : <span className="metric">{new Intl.NumberFormat('nb-NO', { maximumFractionDigits: 2 }).format(value)}{format === 'percent' ? '%' : ''}</span>; }
