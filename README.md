@@ -65,3 +65,5 @@ Følgende er bevisst ikke funnet på i demoen og vises som manglende når datagr
 Filtre, lagvalg, egen sannsynlighet og lagrede kuponger lagres under `kampinnsikt:*` i `localStorage`. Nullstill-knappen fjerner bare disse nøklene. Kuponger kan eksporteres som JSON eller CSV. Kombinert implisitt sannsynlighet merkes som upålitelig når valg kan være korrelerte.
 
 Se også [ARCHITECTURE.md](./ARCHITECTURE.md) og [analysemodulens dokumentasjon](./src/analytics/README.md).
+
+<!-- Tvinger nytt bygg -->
