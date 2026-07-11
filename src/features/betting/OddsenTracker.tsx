@@ -382,6 +382,7 @@ export function OddsenTracker() {
   const [detectedRegions, setDetectedRegions] = useState(0);
   const [importError, setImportError] = useState('');
   const [importedCount, setImportedCount] = useState(0);
+  const [appendImport, setAppendImport] = useState(false);
 
   useEffect(() => { localStorage.setItem('oddsen-tracker:theme', theme); }, [theme]);
   useEffect(() => { localStorage.setItem(STORAGE_KEY, JSON.stringify(bets)); }, [bets]);
@@ -435,13 +436,65 @@ export function OddsenTracker() {
     setSelected((all) => { const next = new Set(all); ids.forEach((id) => next.delete(id)); return next; });
   }
 
+  function removeMatch(match: string) {
+    const ids = bets.filter((bet) => bet.match === match).map((bet) => bet.id);
+    setBets((all) => all.filter((bet) => bet.match !== match));
+    setSelected((all) => { const next = new Set(all); ids.forEach((id) => next.delete(id)); return next; });
+    setFilters((all) => { const next = { ...all }; delete next[match]; return next; });
+  }
+
   function removeAllCoupons() {
     setBets([]);
     setSelected(new Set());
   }
 
-  function openImport(mode: ImportMode = 'image') { setImportMode(mode); setImportOpen(true); setImportStep('source'); setImportError(''); setDetectedRegions(0); }
-  function closeImport() { uploadFiles.forEach((item) => URL.revokeObjectURL(item.url)); setUploadFiles([]); setDrafts([]); setImportText(''); setImportError(''); setImportOpen(false); setOcrProgress(0); setDetectedRegions(0); }
+  function resetImportSource() {
+    uploadFiles.forEach((item) => URL.revokeObjectURL(item.url));
+    setUploadFiles([]);
+    setImportText('');
+    setImportError('');
+    setOcrProgress(0);
+    setDetectedRegions(0);
+  }
+
+  function openImport(mode: ImportMode = 'image') {
+    setImportMode(mode);
+    setImportOpen(true);
+    setImportStep('source');
+    setAppendImport(false);
+    setImportError('');
+    setDetectedRegions(0);
+  }
+
+  function closeImport() {
+    resetImportSource();
+    setDrafts([]);
+    setAppendImport(false);
+    setImportOpen(false);
+  }
+
+  function returnToImportSource() {
+    resetImportSource();
+    setAppendImport(false);
+    setImportStep('source');
+  }
+
+  function beginAdditionalImport() {
+    const preserveCurrentDrafts = importStep === 'review';
+    resetImportSource();
+    if (!preserveCurrentDrafts) setDrafts([]);
+    setAppendImport(preserveCurrentDrafts);
+    setImportMode('image');
+    setImportStep('source');
+  }
+
+  function acceptImportedDrafts(items: ImportDraft[]) {
+    setDrafts((current) => appendImport ? [...current, ...items] : items);
+    setAppendImport(false);
+    setImportStep('review');
+    setImportError('');
+  }
+
   function addFiles(files: FileList | File[]) {
     const images = [...files].filter((file) => file.type.startsWith('image/')).slice(0, Math.max(0, 8 - uploadFiles.length));
     if (!images.length) return setImportError('Velg PNG-, JPG- eller WEBP-bilder.');
@@ -452,7 +505,7 @@ export function OddsenTracker() {
     if (importMode === 'text') {
       const parsed = parseCouponText(importText, 'Innlimt tekst');
       if (!parsed.length) return setImportError('Fant ingen komplette kuponger. Kontroller teksten eller velg «Registrer manuelt».');
-      setDrafts(parsed); setImportStep('review'); setImportError(''); return;
+      acceptImportedDrafts(parsed); return;
     }
     if (!uploadFiles.length || ocrBusy) return setImportError('Legg til minst ett skjermbilde først.');
     setOcrBusy(true); setImportError(''); setOcrProgress(0);
@@ -486,7 +539,7 @@ export function OddsenTracker() {
         else found.push({ ...draft(), sourceName: region.sourceName, sourcePreview: region.previewUrl });
         setOcrProgress((index + 1) / finalRegions.length);
       }
-      setDrafts(found); setImportStep('review');
+      acceptImportedDrafts(found);
     } catch (error) {
       console.error(error); setImportError('Bildelesingen kunne ikke fullføres. Sjekk nettilgangen til språkmodellen, eller bruk tekstimport.');
     } finally { if (worker) await worker.terminate(); setOcrBusy(false); }
@@ -524,7 +577,7 @@ export function OddsenTracker() {
         <nav className="tracker-nav" aria-label="Oddsen-Tracker">
           <a className="tracker-brand" href="#top" aria-label="Oddsen-Tracker, til toppen"><span className="brand-orbit"><Trophy size={17} /></span><span><strong>Oddsen-Tracker</strong><small>Din personlige kupongoversikt</small></span></a>
           <div className="nav-actions">
-            <button className="nav-import" type="button" onClick={() => openImport('image')}><Upload size={15} /><span>Importer kupong</span></button>
+            {bets.length > 0 && <button className="nav-import" type="button" onClick={() => openImport('image')}><Upload size={15} /><span>Importer kupong</span></button>}
             <button className="theme-toggle" type="button" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} aria-label={`Bytt til ${theme === 'dark' ? 'lyst' : 'mørkt'} tema`}><Sun className="sun-icon" size={17} /><Moon className="moon-icon" size={17} /></button>
           </div>
         </nav>
@@ -536,7 +589,7 @@ export function OddsenTracker() {
         </section>
 
         <section className="overview-card" aria-labelledby="overview-title">
-          <div className="overview-copy"><span className="section-kicker">Oddsenoversikt</span><h2 id="overview-title">Mine <em>spill</em></h2><p>Alle kuponger og spillvalg samlet på ett sted. Bruk «Importer kupong» øverst for bilde, tekst eller manuell registrering.</p></div>
+          <div className="overview-copy"><span className="section-kicker">Oddsenoversikt</span><h2 id="overview-title">Mine <em>spill</em></h2><p>{bets.length ? 'Alle kuponger og spillvalg samlet på ett sted. Bruk importsnarveien øverst når du vil legge til flere.' : 'Arbeidsområdet er tomt. Start med skjermbilder, kupongtekst eller manuell registrering i importfeltet under.'}</p></div>
           <dl className="overview-stats"><div><dt>Aktive kuponger</dt><dd>{totals.coupons}</dd></div><div><dt>Total innsats</dt><dd>{money.format(totals.stake)} kr</dd></div><div><dt>Største enkeltpremie</dt><dd>{money.format(bets.reduce((max, bet) => Math.max(max, bet.payout), 0))} kr</dd></div><div><dt>Snittodds</dt><dd>{totals.averageOdds ? totals.averageOdds.toFixed(2) : '—'}</dd></div></dl>
         </section>
 
@@ -547,7 +600,7 @@ export function OddsenTracker() {
             const groupTotals = trackedSummary(group.bets);
             const codes = teamCodes(group.match); const lead = group.bets[0];
             return <section className="match-card" key={group.match} aria-label={group.match}>
-              <header className="match-header"><div><span className="section-kicker">{lead.competition || 'Fotball-VM 2026'} / Kamp</span><time className="match-kickoff">{lead.kickoff}</time><h2>{codes.special ? <strong className="event-title">{group.match}</strong> : <><b>{codes.home}</b><i>VS</i><b>{codes.away}</b></>}</h2></div><dl><div><dt>Kuponger</dt><dd>{groupTotals.coupons}</dd></div><div><dt>Satset</dt><dd>{money.format(groupTotals.stake)} kr</dd></div><div><dt>Toppodds</dt><dd>{groupTotals.highest.toFixed(2)}</dd></div></dl></header>
+              <header className="match-header"><div><span className="section-kicker">{lead.competition || 'Fotball-VM 2026'} / Kamp</span><time className="match-kickoff">{lead.kickoff}</time><h2>{codes.special ? <strong className="event-title">{group.match}</strong> : <><b>{codes.home}</b><i>VS</i><b>{codes.away}</b></>}</h2></div><div className="match-header-side"><dl><div><dt>Kuponger</dt><dd>{groupTotals.coupons}</dd></div><div><dt>Satset</dt><dd>{money.format(groupTotals.stake)} kr</dd></div><div><dt>Toppodds</dt><dd>{groupTotals.highest.toFixed(2)}</dd></div></dl><button className="delete-match-button" type="button" onClick={() => { if (window.confirm(`Slett hele spillet «${group.match}»? Dette fjerner ${groupTotals.coupons} ${groupTotals.coupons === 1 ? 'kupong' : 'kuponger'} og ${group.bets.length} ${group.bets.length === 1 ? 'spillvalg' : 'spillvalg'}.`)) removeMatch(group.match); }}><Trash2 size={15} /> Slett hele spillet</button></div></header>
               <div className="filter-bar" aria-label={`Filtrer spill for ${group.match}`}>{CATEGORIES.map((category) => { const count = category === 'Alle' ? group.bets.length : group.bets.filter((bet) => bet.category === category).length; if (category !== 'Alle' && !count) return null; return <button key={category} type="button" className={filter === category ? 'active' : ''} aria-pressed={filter === category} onClick={() => setFilters((all) => ({ ...all, [group.match]: category }))}>{category}<span>{count}</span></button>; })}<p><GripVertical size={14} /> Dra for å endre rekkefølge</p></div>
               <div className="bet-columns" aria-hidden="true"><span /><span>Type og spill</span><span>Odds</span><span>Innsats</span><span>Mulig premie</span><span /></div>
               <div className="bet-list" role="listbox" aria-label={`Spill for ${group.match}`} aria-multiselectable="true">{visible.map((bet, index) => {
@@ -559,12 +612,12 @@ export function OddsenTracker() {
             </section>;
           })}
           <section className="workspace-danger-zone" aria-label="Administrer kuponger"><div><strong>Administrer arbeidsområdet</strong><span>Fjern alle lagrede kuponger fra denne nettleseren.</span></div><button className="delete-all-button" type="button" onClick={() => { if (window.confirm(`Slett alle ${totals.coupons} kuponger? Dette kan ikke angres.`)) removeAllCoupons(); }}><Trash2 size={17} /> Slett alle kuponger</button></section>
-        </> : <section className="empty-dashboard"><div className="empty-visual"><Upload size={28} /></div><span className="section-kicker">Arbeidsområdet er klart</span><h2>Importer din første kupong</h2><p>Bruk «Importer kupong» øverst. Der velger du skjermbilde, kupongtekst eller manuell registrering på ett samlet sted.</p></section>}
+        </> : <section className="empty-dashboard" aria-labelledby="empty-dashboard-title"><button className="empty-visual" type="button" onClick={() => openImport('image')} aria-label="Åpne import av kupong" title="Importer kupong"><Upload size={28} /></button><span className="section-kicker">Arbeidsområdet er klart</span><h2 id="empty-dashboard-title">Importer din første kupong</h2><p>Klikk på ikonet for å starte med skjermbilder. Kupongtekst og manuell registrering velges i samme importdialog.</p><div className="empty-methods" aria-label="Tilgjengelige importmetoder"><span><ImageIcon size={13} /> Skjermbilder</span><span><FileText size={13} /> Kupongtekst</span><span><Plus size={13} /> Manuelt</span></div></section>}
       </main>
 
       {importOpen && <div className="modal-backdrop" role="presentation">
         <section className="import-dialog" role="dialog" aria-modal="true" aria-labelledby="import-title">
-          <header className="import-header"><div><span className="section-kicker">{importStep === 'review' ? 'Kontroller før lagring' : importStep === 'success' ? 'Import fullført' : 'Ny kupongimport'}</span><h2 id="import-title">{importStep === 'review' ? `${draftCouponCount} ${draftCouponCount === 1 ? 'kupong' : 'kuponger'} · ${drafts.length} spillvalg` : importStep === 'success' ? 'Kupongene er lagt til' : 'Importer kupong'}</h2></div><button type="button" onClick={closeImport} aria-label="Lukk"><X /></button></header>
+          <header className="import-header"><div><span className="section-kicker">{importStep === 'review' ? 'Kontroller før lagring' : importStep === 'success' ? 'Import fullført' : appendImport ? 'Utvid innlesningen' : 'Ny kupongimport'}</span><h2 id="import-title">{importStep === 'review' ? `${draftCouponCount} ${draftCouponCount === 1 ? 'kupong' : 'kuponger'} · ${drafts.length} spillvalg` : importStep === 'success' ? 'Kupongene er lagt til' : appendImport ? 'Importer flere kuponger' : 'Importer kupong'}</h2></div><button type="button" onClick={closeImport} aria-label="Lukk"><X /></button></header>
           {importStep === 'source' && <div className="import-body">
             <div className="import-tabs" role="tablist" aria-label="Velg importmetode"><button type="button" role="tab" aria-selected={importMode === 'image'} className={importMode === 'image' ? 'active' : ''} onClick={() => { setImportMode('image'); setImportError(''); }}><ImageIcon size={16} /> Skjermbilder</button><button type="button" role="tab" aria-selected={importMode === 'text'} className={importMode === 'text' ? 'active' : ''} onClick={() => { setImportMode('text'); setImportError(''); }}><FileText size={16} /> Kupongtekst</button></div>
             {importMode === 'image' ? <><input id="coupon-images" className="sr-only" type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={(event: ChangeEvent<HTMLInputElement>) => event.target.files && addFiles(event.target.files)} /><label className="dropzone" htmlFor="coupon-images" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles(event.dataTransfer.files); }}><Upload size={30} /><strong>Slipp skjermbilder her</strong><span>eller klikk for å velge PNG, JPG eller WEBP · maks 8 bilder</span></label>{uploadFiles.length > 0 && <div className="image-queue">{uploadFiles.map((item) => <figure key={item.url}><img src={item.url} alt={item.file.name} /><figcaption>{item.file.name}</figcaption><button type="button" onClick={() => { URL.revokeObjectURL(item.url); setUploadFiles((all) => all.filter((file) => file.url !== item.url)); }} aria-label={`Fjern ${item.file.name}`}><X size={14} /></button></figure>)}</div>}{ocrBusy && <div className="ocr-progress"><div><Loader2 className="spin" size={17} /><span>{detectedRegions ? `${detectedRegions} kupongområder funnet` : 'Deler bildet i kuponger'} · {Math.round(ocrProgress * 100)} %</span></div><i style={{ width: `${Math.round(ocrProgress * 100)}%` }} /></div>}</> : <label className="text-source">Kupongtekst<textarea value={importText} onChange={(event) => setImportText(event.target.value)} placeholder={'Lim inn én eller flere kvitteringer her…\n\nInnsats: 100,00\nOdds: 2.10\nMulig Premie: 210,00\n1. Norge v England\nStarttid: 11/7 23:00\nSpillobjekt: Scorer mål\nSpilt utfall: Erling Haaland'} /></label>}
@@ -584,7 +637,18 @@ export function OddsenTracker() {
             {importError && <p className="import-error">{importError}</p>}
           </div>}
           {importStep === 'success' && <div className="import-success"><span><Check /></span><h3>{importedCount} {importedCount === 1 ? 'kupong importert' : 'kuponger importert'}</h3><p>Spillene er lagret lokalt og vises nå i kampoversikten.</p></div>}
-          <footer className="import-footer"><div>{importStep === 'review' && <button type="button" className="secondary-button" onClick={() => setImportStep('source')}><ChevronLeft size={16} /> Tilbake</button>}{importStep === 'source' && <button type="button" className="secondary-button" onClick={() => { setDrafts([draft()]); setImportStep('review'); }}>Registrer manuelt</button>}</div><div>{importStep === 'source' && <button type="button" className="primary-button" disabled={ocrBusy} onClick={processSource}>{ocrBusy ? <Loader2 className="spin" size={17} /> : importMode === 'image' ? <ImageIcon size={17} /> : <FileText size={17} />}{ocrBusy ? 'Leser bilder' : importMode === 'image' ? 'Les skjermbilder' : 'Finn kuponger'}</button>}{importStep === 'review' && <><button type="button" className="secondary-button" onClick={() => setDrafts((all) => [...all, draft()])}><Plus size={16} /> Legg til rad</button><button type="button" className="primary-button" onClick={commitImport}><Check size={17} /> Lagre kuponger</button></>}{importStep === 'success' && <button type="button" className="primary-button" onClick={closeImport}>Ferdig</button>}</div></footer>
+          <footer className="import-footer">
+            <div>
+              {importStep === 'review' && <><button type="button" className="secondary-button" onClick={returnToImportSource}><ChevronLeft size={16} /> Tilbake</button><button type="button" className="secondary-button import-more-button" onClick={beginAdditionalImport}><Upload size={16} /> Importer flere</button></>}
+              {importStep === 'source' && <button type="button" className="secondary-button" onClick={() => acceptImportedDrafts([draft()])}>Registrer manuelt</button>}
+              {importStep === 'success' && <button type="button" className="secondary-button import-more-button" onClick={beginAdditionalImport}><Upload size={16} /> Importer flere kuponger</button>}
+            </div>
+            <div>
+              {importStep === 'source' && <button type="button" className="primary-button" disabled={ocrBusy} onClick={processSource}>{ocrBusy ? <Loader2 className="spin" size={17} /> : importMode === 'image' ? <ImageIcon size={17} /> : <FileText size={17} />}{ocrBusy ? 'Leser bilder' : importMode === 'image' ? 'Les skjermbilder' : 'Finn kuponger'}</button>}
+              {importStep === 'review' && <><button type="button" className="secondary-button" onClick={() => setDrafts((all) => [...all, draft()])}><Plus size={16} /> Legg til rad</button><button type="button" className="primary-button" onClick={commitImport}><Check size={17} /> Lagre kuponger</button></>}
+              {importStep === 'success' && <button type="button" className="primary-button" onClick={closeImport}>Ferdig</button>}
+            </div>
+          </footer>
         </section>
       </div>}
     </div>
