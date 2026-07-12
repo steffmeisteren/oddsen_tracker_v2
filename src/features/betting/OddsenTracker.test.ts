@@ -1,8 +1,12 @@
-import { describe, expect, it } from 'vitest';
-import { detectCouponBoxes, detectOcrGridBoxes, draftErrors, parseCouponText } from './OddsenTracker';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { detectCouponBoxes, detectOcrGridBoxes, draftErrors, mergePositionedWithText, parseCouponText, parsePositionedCoupon } from './OddsenTracker';
+
+afterEach(() => vi.useRealTimers());
 
 describe('kupongimport', () => {
   it('leser en komplett Oddsen-kvittering', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-12T12:00:00Z'));
     const result = parseCouponText(`Innsats: 100,00
 Odds: 2.10
 Mulig Premie: 210,00
@@ -17,8 +21,52 @@ Kupongnummer: 123.1`);
     expect(result).toHaveLength(1);
     expect(result[0]).toMatchObject({
       match: 'Norge v England', market: 'Scorer mål', selection: 'Erling Haaland',
-      odds: '2.1', stake: '100', payout: '210', category: 'Spiller', coupon: '123.1',
+      kickoff: '11.07.2026 23:00', odds: '2.1', stake: '100', payout: '210', category: 'Spiller', coupon: '123.1',
     });
+  });
+
+  it.each([
+    ['Fre. 10/7 21:00', '10.07.2026 21:00'],
+    ['Lør. 11/7 23:00', '11.07.2026 23:00'],
+    ['Søn. 19/7 02:00', '19.07.2026 02:00'],
+    ['Fre. 10 / 7 21 : 00', '10.07.2026 21:00'],
+  ])('bruker inneværende år for norsk starttid %s', (starttid, expected) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-12T12:00:00Z'));
+    const [result] = parseCouponText(`Innsats: 100,00
+Odds: 2.10
+Mulig Premie: 210,00
+1. Spania v Belgia
+Starttid: ${starttid}
+Konkurranse: Internasjonal - Fotball - VM
+Spillobjekt: Totalt antall mål
+Spillutfall: Over 3.5
+Kupongnummer: 299682724.1`);
+    expect(result.kickoff).toBe(expected);
+  });
+
+  it.each([
+    ['Spania og Under 2.5 mål', '4.20', '420,00', 'Singel Aktiv'],
+    ['Over 3.5', '2.10', '210,00', 'System Levert'],
+    ['Ja', '11.50', '1150,00', 'Singel Levert'],
+  ])('henter «%s» rett under Spillutfall og ignorerer kupongstatus', (selection, odds, payout, status) => {
+    const [result] = parseCouponText(`Oddsen
+${status}
+Innsats: 100,00
+Odds: ${odds}
+Mulig Premie: ${payout}
+1. Spania v Belgia
+Starttid: Fre. 10/7 21:00
+Konkurranse: Internasjonal - Fotball - VM
+Spillobjekt: HUB og antall mål
+Spillutfall:
+${selection}
+${odds}
+Levert: 10.07.2026, kl. 00:27:21
+Kupongnummer: 299681641.1`);
+
+    expect(result.selection).toBe(selection);
+    expect(result.selection).not.toMatch(/Singel|System|Aktiv|Levert/i);
   });
 
   it('leser flere kuponger i samme tekst', () => {
@@ -40,7 +88,7 @@ Starttid: Fre. 10/7 21:00
 Konkurranse: Fotball-VM
 Spillobjekt: Begge lag scorer
 Spilt utfall: Ja 2.00
-Kupongnummer: 99.1`);
+Kupongnummer: 29968164.1`);
 
     expect(results).toHaveLength(2);
     expect(results.map((item) => item.match)).toEqual(['Norge v England', 'Spania v Belgia']);
@@ -81,7 +129,7 @@ Kupongnummer: 99.1`);
   });
 
   it('retter OCR-odds der desimalpunktet blir lest som mellomrom', () => {
-    const [item] = parseCouponText('Innsats: 50,00\nOdds: 2 10\nMulig Premie: 105,00\n1. Spania v Belgia\nStarttid: 10/7 21:00\nKonkurranse: Fotball-VM\nSpillobjekt: Totalt antall mål\nSpilt utfall: Over 3,5\nKupongnummer: 1.1');
+    const [item] = parseCouponText('Innsats: 50,00\nOdds: 2 10\nMulig Premie: 105,00\n1. Spania v Belgia\nStarttid: 10/7 21:00\nKonkurranse: Fotball-VM\nSpillobjekt: Totalt antall mål\nSpilt utfall: Over 3,5\nKupongnummer: 29968164.1');
     expect(item.odds).toBe('2.1');
     expect(draftErrors(item)).toEqual([]);
   });
@@ -107,6 +155,55 @@ Kupongnummer: 99.1`);
     })));
     const boxes = detectOcrGridBoxes(480, 760, [{ paragraphs: [{ lines }] }]);
     expect(boxes).toHaveLength(10);
+  });
+
+  it('bruker de posisjonerte Spillutfall-radene under sammendraget, ikke kuponghodet', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-12T12:00:00Z'));
+    const line = (text: string, y: number, x0 = 20, x1 = 220) => ({ text, bbox: { x0, y0: y, x1, y1: y + 10 } });
+    const blocks = [{ paragraphs: [{ lines: [
+      line('Oddsen Singel Aktiv', 0, 10, 300),
+      line('Innsats: 300,00', 20),
+      line('Odds: 4.20', 40, 20, 100),
+      line('Mulig Premie: 1260,00', 40, 120, 300),
+      line('1. Spania v Belgia', 90),
+      line('Starttid:', 110),
+      line('Fre. 10/7 21:00', 130),
+      line('Konkurranse:', 150),
+      line('Internasjonal - Fotball - VM', 170),
+      line('Spillobjekt:', 190),
+      line('HUB og antall mål', 210),
+      line('Spillutfall:', 230),
+      line('Spania og Under 2.5 mål', 250, 20, 190),
+      line('4.20', 250, 240, 280),
+      line('Levert: 10.07.2026, kl. 00:27:21', 280),
+      line('Kupongnummer: 299681641.1', 300),
+    ] }] }];
+
+    const result = parsePositionedCoupon(blocks);
+    expect(result).toMatchObject({
+      match: 'Spania v Belgia',
+      kickoff: '10.07.2026 21:00',
+      market: 'HUB og antall mål',
+      selection: 'Spania og Under 2.5 mål',
+      odds: '4.2',
+      stake: '300',
+      payout: '1260',
+    });
+    expect(result?.selection).not.toMatch(/Oddsen|Singel|System|Aktiv|Levert/i);
+
+    const textResult = parseCouponText(`Innsats: 300,00
+Odds: 4.20
+Mulig Premie: 1260,00
+1. Spania v Belgia
+Starttid: Fre. 10/7 21:00
+Konkurranse: Internasjonal - Fotball - VM
+Spillobjekt: HUB og antall mål
+Spillutfall: Spania og Under 2.5 mål
+Kupongnummer: 299681641.1`);
+    const positionedWithHeaderSelection = result ? { ...result, selection: '> Oddsen sige Aktiv' } : null;
+    const [merged] = mergePositionedWithText(positionedWithHeaderSelection, textResult);
+    expect(merged).toMatchObject({ kickoff: '10.07.2026 21:00', selection: 'Spania og Under 2.5 mål' });
   });
 
   it('stopper sammenslått OCR-tekst og økonomiavvik', () => {

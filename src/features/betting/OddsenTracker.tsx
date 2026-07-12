@@ -169,10 +169,56 @@ function normalizeOcrText(rawText: string) {
 }
 
 const OCR_FIELD_NAMES = 'Innsats|Odds|Mulig Premie|Starttid|Kampstart|Konkurranse|Spillobjekt|Marked|Spilt utfall|Utfall|Spillvalg|Levert|Kupongnummer';
+const OUTCOME_LABEL = /^(?:Spilt\s*utfall|Spill\s*utfall|Utfall|Spillvalg)\b/i;
+const RECEIPT_FIELD_LABEL = /^(?:Innsats|Odds|Mulig Premie|Starttid|Kampstart|Konkurranse|Spillobjekt|Marked|Spilt\s*utfall|Spill\s*utfall|Utfall|Spillvalg|Levert|Kupongnummer)\b/i;
+const RECEIPT_METADATA_WORDS = /\b(?:Singel|System|Aktiv|Levert)\b/i;
 
 function fieldAfter(text: string, label: string) {
   const match = text.match(new RegExp(`(?:^|\\n|\\s)(?:${label})\\b\\s*:?\\s*([\\s\\S]*?)(?=(?:\\n|\\s)+(?:${OCR_FIELD_NAMES})\\b\\s*:?|$)`, 'i'));
   return clean(match?.[1] || '');
+}
+
+function invalidSelectionCandidate(value: string) {
+  const normalized = clean(value);
+  if (!normalized || RECEIPT_METADATA_WORDS.test(normalized)) return true;
+  if (/^(?:Oddsen|Singel|System|Aktiv|Levert)(?:\s|$)/i.test(normalized)) return true;
+  return /\b(?:Spillobjekt|Spilt?\s*utfall|Spillvalg|Kupongnummer|Konkurranse|Mulig\s+Premie|Innsats)\b/i.test(normalized);
+}
+
+/**
+ * Reads only the value belonging to the explicit outcome label. Receipt status
+ * text above the event must never be used as a fallback selection.
+ */
+function outcomeSelectionFromText(text: string) {
+  const lines = normalizeOcrText(text).split('\n').map(clean).filter(Boolean);
+  const labelIndex = lines.findIndex((line) => OUTCOME_LABEL.test(line));
+  if (labelIndex < 0) return { foundLabel: false, value: '' };
+
+  const values: string[] = [];
+  const inline = clean(lines[labelIndex].replace(OUTCOME_LABEL, '').replace(/^\s*:?\s*/, ''));
+  if (inline && !invalidSelectionCandidate(inline)) values.push(inline);
+
+  for (let index = labelIndex + 1; index < lines.length && values.length < 5; index += 1) {
+    const line = clean(lines[index]);
+    if (!line) continue;
+    if (RECEIPT_FIELD_LABEL.test(line) || /^\d{1,2}[.)]\s+/.test(line) || invalidSelectionCandidate(line)) break;
+    if (/^\d{1,3}(?:(?:[.,]|\s)\d{2})$/.test(line)) break;
+    values.push(line);
+  }
+
+  const value = clean(values.join(' '));
+  return { foundLabel: true, value: invalidSelectionCandidate(value) ? '' : value };
+}
+
+function stripTrailingReceiptOdds(value: string, receiptOdds: number, force = false) {
+  const normalized = clean(value);
+  const match = normalized.match(/^(.*\S)\s+(\d{1,3}(?:(?:[.,]|\s)\d{2}))\s*$/);
+  if (!match) return normalized;
+  if (/\b(?:over|under)\s*$/i.test(match[1])) return normalized;
+  const trailing = oddsFrom(match[2]);
+  return trailing > 1 && (force || (receiptOdds > 1 && Math.abs(trailing - receiptOdds) <= .02))
+    ? clean(match[1])
+    : normalized;
 }
 
 function labeledNumber(text: string, label: string, isOdds = false) {
@@ -204,7 +250,7 @@ function receiptLineKey(value: string) {
 
 function receiptNoiseLine(value: string) {
   const line = receiptLineKey(value);
-  return !line || /^(?:oddsen|singel|aktiv|vis detaljer|skjul detaljer)$/.test(line) ||
+  return !line || /^(?:oddsen(?:\s+(?:singel|system|aktiv|levert))*|singel|system|aktiv|levert|vis detaljer|skjul detaljer)$/.test(line) ||
     /\b(?:rekke|innsats|odds|mulig premie|kupongnummer|levert)\b/.test(line) ||
     /^\d+(?:[.,]\d+)?(?: kr)?$/.test(line);
 }
@@ -217,8 +263,9 @@ function semanticMarketLine(value: string) {
 function semanticSelectionLine(value: string) {
   const line = clean(value);
   const key = receiptLineKey(line);
-  if (!line || receiptNoiseLine(line) || semanticMarketLine(line)) return false;
-  if (/^(?:ja|nei|over\s+\d|under\s+\d|uavgjort\s*-\s*.+|[12xhub]|[a-zæøå .'-]+\s*&\s*[a-zæøå .'-]+)$/i.test(line)) return true;
+  if (!line || invalidSelectionCandidate(line) || receiptNoiseLine(line)) return false;
+  if (/^(?:ja|nei|over\s+\d|under\s+\d|.+\s+og\s+(?:over|under)\s+\d|uavgjort\s*-\s*.+|[12xhub]|[a-zæøå .'-]+\s*&\s*[a-zæøå .'-]+)$/i.test(line)) return true;
+  if (semanticMarketLine(line)) return false;
   if (/\b(?:norge|england|spania|belgia|frankrike|marokko|haaland|mbapp[eé]|kane)\b/i.test(line) && !/\s(?:v|vs\.?|mot)\s/i.test(line)) return true;
   if (/^[A-ZÆØÅ][A-Za-zÆØÅæøåÉé.'-]+(?:\s+[A-ZÆØÅ][A-Za-zÆØÅæøåÉé.'-]+){0,4}$/.test(line)) return true;
   return key.length >= 2 && key.length <= 90 && /[a-zæøå]/i.test(line) && /(?:^|\s)(?:ja|nei)$/.test(key);
@@ -248,7 +295,8 @@ function inferReceiptHints(text: string): ReceiptHints {
   };
 
   let market = valueAfter(/^(?:Spillobjekt|Marked)\b/i);
-  let selection = valueAfter(/^(?:Spilt utfall|Utfall|Spillvalg)\b/i);
+  const outcome = outcomeSelectionFromText(normalized);
+  let selection = stripTrailingReceiptOdds(outcome.value, labeledNumber(normalized, 'Odds', true));
   const kickoff = valueAfter(/^(?:Starttid|Kampstart)\b/i);
   const competition = valueAfter(/^Konkurranse\b/i);
 
@@ -256,7 +304,7 @@ function inferReceiptHints(text: string): ReceiptHints {
     const marketIndex = lines.findIndex((line) => semanticMarketLine(line) && !receiptNoiseLine(line));
     if (marketIndex >= 0) market = collectFollowingLines(lines, marketIndex, (line) => labelPattern.test(line) || semanticSelectionLine(line), 5);
   }
-  if (!selection) {
+  if (!selection && !outcome.foundLabel) {
     const marketIndex = market ? lines.findIndex((line) => market.includes(clean(line)) || clean(line).includes(clean(market))) : -1;
     const candidates = lines.slice(Math.max(0, marketIndex + 1));
     selection = clean(candidates.find((line) => semanticSelectionLine(line)) || '');
@@ -286,7 +334,9 @@ function looseDraftFromText(text: string, sourceName?: string, sourcePreview?: s
   const candidates = [fieldAfter(normalized, 'Kamp'), numberedMatch, inlineMatch, clean(versusLine || ''), hints.match];
   const explicitMatch = candidates.find((value) => !invalidMatchCandidate(value)) || '';
   const market = fieldAfter(normalized, 'Spillobjekt|Marked') || hints.market;
-  const selection = fieldAfter(normalized, 'Spilt utfall|Utfall|Spillvalg') || hints.selection;
+  const odds = labeledNumber(normalized, 'Odds', true);
+  const outcome = outcomeSelectionFromText(normalized);
+  const selection = stripTrailingReceiptOdds(outcome.value || (!outcome.foundLabel ? hints.selection : ''), odds);
   const kickoffRaw = fieldAfter(normalized, 'Starttid|Kampstart') || hints.kickoff ||
     normalized.match(/\b(?:I\s*dag|Idag|I\s*morgen)\s*\d{1,2}\s*[:.]\s*\d{2}\b/i)?.[0] || '';
   const purchaseText = lines.find((line) => /\bDato\b/i.test(line)) ||
@@ -296,7 +346,6 @@ function looseDraftFromText(text: string, sourceName?: string, sourcePreview?: s
   const couponRaw = normalized.match(/(?:Kupongnummer|\b(?:ID|1D|lD))\s*:?\s*([0-9][0-9., ]{5,})/i)?.[1] || '';
   const coupon = clean(couponRaw.replace(/\s/g, '').replace(/(?<=\d),(?=\d)/g, '.'));
   const stake = labeledNumber(normalized, 'Innsats');
-  const odds = labeledNumber(normalized, 'Odds', true);
   const payout = labeledNumber(normalized, 'Mulig Premie');
   if (!explicitMatch && !market && !selection && !stake && !odds && !payout && !coupon) return null;
   const item = draft();
@@ -330,7 +379,7 @@ function mergeDraftData(primary: ImportDraft, fallback: ImportDraft | null): Imp
     competition: emptyOr(primary.competition, 'Fotball-VM 2026') && fallback.competition !== 'Fotball-VM 2026' ? fallback.competition : primary.competition,
     coupon: primary.coupon || fallback.coupon,
     market,
-    selection: primary.selection || fallback.selection,
+    selection: invalidSelectionCandidate(primary.selection) ? fallback.selection : primary.selection,
     category: inferCategory(market),
     odds: primary.odds || fallback.odds,
     stake: primary.stake || fallback.stake,
@@ -357,13 +406,14 @@ export function parseCouponText(rawText: string, sourceName?: string, sourcePrev
     const parseSection = (section: string, fallbackMatch = ''): ImportDraft => {
       const sectionLoose = looseDraftFromText(section, sourceName, sourcePreview) || loose;
       const market = clean(section.match(/Spillobjekt\s*:?\s*([\s\S]*?)(?=\s*Spilt\s+utfall)/i)?.[1] || section.match(/Marked\s*:?\s*([^\n]+)/i)?.[1] || sectionLoose?.market || '');
-      let selection = clean(section.match(/Spilt\s+utfall\s*:?\s*([\s\S]*?)(?=\s*(?:Levert|Kupongnummer|\n\s*\d+\.|$))/i)?.[1] || section.match(/Utfall\s*:?\s*([^\n]+)/i)?.[1] || sectionLoose?.selection || '');
-      const selectionOdds = selection.match(/\s+([0-9]+(?:(?:[.,]|\s)[0-9]{1,2})?)$/);
       const odds = oddsFrom(summary[2]) || oddsFrom(sectionLoose?.odds);
-      if (selectionOdds) {
+      const outcome = outcomeSelectionFromText(section);
+      const rawSelection = clean(outcome.value || (!outcome.foundLabel ? sectionLoose?.selection : '') || '');
+      const selectionOdds = rawSelection.match(/\s+([0-9]+(?:(?:[.,]|\s)[0-9]{1,2})?)$/);
+      let selection = stripTrailingReceiptOdds(rawSelection, odds, markers.length > 1);
+      if (markers.length > 1 && selection !== rawSelection && selectionOdds) {
         const legOdds = oddsFrom(selectionOdds[1]);
-        selection = selection.slice(0, selectionOdds.index).trim();
-        if (markers.length > 1 && legOdds > 1) selection = `${selection} · delodds ${legOdds.toFixed(2)}`;
+        if (legOdds > 1) selection = `${selection} · delodds ${legOdds.toFixed(2)}`;
       }
       const rawMatch = clean(section.match(/(?:^|\n)\s*\d{1,2}[.)]\s+(?=[^\n]*[A-Za-zÆØÅæøå])([^\n]{2,100})/m)?.[1] || section.match(/Kamp\s*:?\s*([^\n]+)/i)?.[1] || sectionLoose?.match || fallbackMatch);
       const kickoff = clean(section.match(/Starttid\s*:?\s*([\s\S]*?)(?=\s*(?:Konkurranse|Spillobjekt))/i)?.[1] || section.match(/Kampstart\s*:?\s*([^\n]+)/i)?.[1] || sectionLoose?.kickoff || '');
@@ -385,7 +435,7 @@ function draftCompletenessScore(item: ImportDraft) {
   let score = 0;
   if (!invalidMatchCandidate(item.match)) score += /\s(?:v|vs\.?|mot)\s|(?:fotball.?vm|vm\s*2026|world cup)/i.test(item.match) ? 45 : 18;
   if (clean(item.market)) score += semanticMarketLine(item.market) ? 55 : 24;
-  if (clean(item.selection)) score += semanticSelectionLine(item.selection) ? 50 : 22;
+  if (!invalidSelectionCandidate(item.selection)) score += semanticSelectionLine(item.selection) ? 50 : 22;
   if (/(?:\d{1,2}[/.]\d{1,2}|\d{1,2}:\d{2})/.test(item.kickoff)) score += 18;
   if (/(?:world cup|fotball.?vm|vm\s*2026|international|internasjonal|spesialer)/i.test(item.competition)) score += 16;
   if (/^\d{6,}(?:\.\d+)?$/.test(item.coupon)) score += 20;
@@ -407,7 +457,7 @@ function draftFieldScore(field: DraftTextField, value: string) {
   if (!normalized) return -1000;
   if (field === 'match') return invalidMatchCandidate(normalized) ? -500 : (/(?:fotball.?vm|vm\s*2026|world cup)|\s(?:v|vs\.?|mot)\s/i.test(normalized) ? 100 : 25);
   if (field === 'market') return semanticMarketLine(normalized) ? 110 + Math.min(35, normalized.length / 3) : 20;
-  if (field === 'selection') return semanticSelectionLine(normalized) ? 105 + Math.min(30, normalized.length / 3) : (semanticMarketLine(normalized) ? -100 : 18);
+  if (field === 'selection') return invalidSelectionCandidate(normalized) ? -500 : (semanticSelectionLine(normalized) ? 105 + Math.min(30, normalized.length / 3) : (semanticMarketLine(normalized) ? -100 : 18));
   if (field === 'kickoff') return /(?:\d{1,2}[/.]\d{1,2}|\d{1,2}:\d{2})/.test(normalized) ? 90 : (normalized === 'Tidspunkt ikke oppgitt' ? -20 : 12);
   if (field === 'competition') return /(?:world cup|fotball.?vm|vm\s*2026|international|internasjonal|spesialer)/i.test(normalized) ? 80 : 16;
   return /^\d{6,}(?:\.\d+)?$/.test(normalized) ? 100 : 5;
@@ -811,7 +861,7 @@ function stripCouponIcons(value: string) {
 
 function positionedNoiseRow(value: string) {
   const key = receiptLineKey(value);
-  return !key || /^(?:oddsen|singel|aktiv|hjem|spill|mine spill|profil|vis detaljer|skjul detaljer)$/.test(key) ||
+  return !key || /^(?:oddsen(?:\s+(?:singel|system|aktiv|levert))*|singel|system|aktiv|levert|hjem|spill|mine spill|profil|vis detaljer|skjul detaljer)$/.test(key) ||
     /^(?:4g|5g|wifi|volte|nfc)(?:\s|$)/.test(key) || /^\d{1,2}:\d{2}(?:\s+\d+)?$/.test(key);
 }
 
@@ -827,6 +877,8 @@ function summaryNumberFromRows(rows: PositionedOcrRow[], label: RegExp, isOdds =
   const index = rows.findIndex((row) => label.test(normalizeOcrText(row.text)));
   if (index < 0) return 0;
   const row = rows[index];
+  const labeled = labeledNumber(normalizeOcrText(row.text), label.source, isOdds);
+  if (labeled > 0) return labeled;
   const withoutLabel = normalizeOcrText(row.text).replace(label, ' ');
   let tokens = numericTokens(withoutLabel);
   if (!tokens.length) {
@@ -843,7 +895,7 @@ function summaryNumberFromRows(rows: PositionedOcrRow[], label: RegExp, isOdds =
 function couponNumberFromRows(rows: PositionedOcrRow[]) {
   for (const row of [...rows].reverse()) {
     const normalized = row.text.replace(/[|]/g, ' ').replace(/(?<=\d),(?=\d)/g, '.');
-    const match = normalized.match(/\b(?:ID|1D|lD|I0)\s*[:.]?\s*([0-9][0-9 .]{5,}(?:\.[0-9]+)?)/i);
+    const match = normalized.match(/\b(?:Kupongnummer|ID|1D|lD|I0)\s*[:.]?\s*([0-9][0-9 .]{5,}(?:\.[0-9]+)?)/i);
     const coupon = clean((match?.[1] || '').replace(/\s/g, ''));
     if (/^\d{6,12}(?:\.\d+)?$/.test(coupon)) return coupon;
   }
@@ -854,11 +906,16 @@ interface CouponDateParts { day: number; month: number; year: number; hour: numb
 
 function parseCouponDateParts(value: string): CouponDateParts | null {
   const normalized = clean(value).toLocaleLowerCase('nb-NO').replace(/,/g, ' ');
-  const named = normalized.match(/(?:dato\s*)?(\d{1,2})\.?\s+(januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember)\s+(\d{4})\s+(\d{1,2})[:.]([0-9]{2})/i);
-  if (named) return { day: Number(named[1]), month: NORWEGIAN_MONTHS[named[2]], year: Number(named[3]), hour: Number(named[4]), minute: Number(named[5]) };
-  const numeric = normalized.match(/(?:dato\s*)?(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?\s+(\d{1,2})[:.]([0-9]{2})/i);
+  const weekday = '(?:(?:man(?:dag)?|tir(?:sdag)?|ons(?:dag)?|tor(?:sdag)?|fre(?:dag)?|l[øo]r(?:dag)?|s[øo]n(?:dag)?)\\.?\\s+)?';
+  const named = normalized.match(new RegExp(`${weekday}(?:dato\\s*)?(\\d{1,2})\\.?\\s+(januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember)(?:\\s+(\\d{2,4}))?\\s+(?:kl\\.?\\s*)?(\\d{1,2})\\s*[:.]\\s*([0-9]{2})`, 'i'));
+  if (named) {
+    let year = Number(named[3] || new Date().getFullYear());
+    if (year > 0 && year < 100) year += 2000;
+    return { day: Number(named[1]), month: NORWEGIAN_MONTHS[named[2]], year, hour: Number(named[4]), minute: Number(named[5]) };
+  }
+  const numeric = normalized.match(new RegExp(`${weekday}(?:dato\\s*)?(\\d{1,2})\\s*[./-]\\s*(\\d{1,2})(?:\\s*[./-]\\s*(\\d{2,4}))?\\s+(?:kl\\.?\\s*)?(\\d{1,2})\\s*[:.]\\s*([0-9]{2})`, 'i'));
   if (!numeric) return null;
-  let year = Number(numeric[3] || 0);
+  let year = Number(numeric[3] || new Date().getFullYear());
   if (year > 0 && year < 100) year += 2000;
   return { day: Number(numeric[1]), month: Number(numeric[2]), year, hour: Number(numeric[4]), minute: Number(numeric[5]) };
 }
@@ -880,9 +937,7 @@ function validCouponDateParts(parts: CouponDateParts | null): parts is CouponDat
 }
 
 function normalizeAbsoluteKickoff(value: string) {
-  const normalized = clean(value)
-    .replace(/\bIdag\b/gi, 'I dag')
-    .replace(/(\d{1,2})\s*[.]\s*(\d{2})(?!\d)/g, '$1:$2');
+  const normalized = clean(value).replace(/\bIdag\b/gi, 'I dag');
   const parts = parseCouponDateParts(normalized);
   return validCouponDateParts(parts) ? formatCouponDate(parts) : '';
 }
@@ -949,7 +1004,7 @@ function kickoffCandidateFromRows(rows: PositionedOcrRow[]) {
       if (relative) return relative;
       const compactRelative = candidate.match(/\b(?:I\s*dag|Idag|I\s*morgen)\s*(?:[01]\d|2[0-3])[0-5]\d\b/i)?.[0];
       if (compactRelative) return compactRelative;
-      const absolute = candidate.match(/\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\s+\d{1,2}\s*[:.]\s*\d{2}\b/)?.[0];
+      const absolute = candidate.match(/\b(?:(?:man|tir|ons|tor|fre|l[øo]r|s[øo]n)\.?\s*)?\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\s+\d{1,2}\s*[:.]\s*\d{2}\b/i)?.[0];
       if (absolute) return absolute;
     }
   }
@@ -959,7 +1014,7 @@ function kickoffCandidateFromRows(rows: PositionedOcrRow[]) {
 function removeKickoffCandidate(value: string) {
   return clean(value
     .replace(/\b(?:I\s*dag|Idag|I\s*morgen)\s*\d{1,2}[:.]\d{2}\b/gi, ' ')
-    .replace(/\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\s+\d{1,2}[:.]\d{2}\b/g, ' '));
+    .replace(/\b(?:(?:man|tir|ons|tor|fre|l[øo]r|s[øo]n)\.?\s*)?\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\s+\d{1,2}[:.]\d{2}\b/gi, ' '));
 }
 
 function competitionCandidate(rows: PositionedOcrRow[], summaryStartY: number) {
@@ -985,11 +1040,56 @@ function stripTrailingSelectionOdds(row: PositionedOcrRow, summaryOdds: number, 
   const text = clean(row.text);
   const match = text.match(/^(.*\S)\s+(\d{1,3}(?:(?:[.,]|\s)\d{2}))\s*$/);
   if (!match) return { text, removed: false };
+  if (/\b(?:over|under)\s*$/i.test(match[1])) return { text, removed: false };
   const candidate = oddsFrom(match[2]);
   const rightMost = row.lines.at(-1);
   const geographicallyRight = Boolean(rightMost && rightMost.bbox.x0 > documentWidth * .52 && /^\s*\d/.test(rightMost.text));
   if ((summaryOdds > 1 && Math.abs(candidate - summaryOdds) <= .02) || geographicallyRight) return { text: clean(match[1]), removed: true };
   return { text, removed: false };
+}
+
+function positionedFieldValue(rows: PositionedOcrRow[], label: RegExp, maximum = 6) {
+  const labelIndex = rows.findIndex((row) => label.test(row.text));
+  if (labelIndex < 0) return '';
+  const values: string[] = [];
+  const inline = clean(rows[labelIndex].text.replace(label, '').replace(/^\s*:?\s*/, ''));
+  if (inline) values.push(inline);
+  for (let index = labelIndex + 1; index < rows.length && values.length < maximum; index += 1) {
+    const value = clean(rows[index].text);
+    if (!value) continue;
+    if (RECEIPT_FIELD_LABEL.test(value) || summaryLabelRow(value) || positionedNoiseRow(value) || /^\d{1,2}[.)]\s+/.test(value)) break;
+    values.push(value);
+  }
+  return clean(values.join(' '));
+}
+
+function positionedOutcomeSelection(rows: PositionedOcrRow[], summaryOdds: number, documentWidth: number) {
+  const labelIndex = rows.findIndex((row) => OUTCOME_LABEL.test(row.text));
+  if (labelIndex < 0) return '';
+  const values: string[] = [];
+
+  const addValue = (row: PositionedOcrRow, value: string) => {
+    const normalized = clean(value);
+    if (!normalized || invalidSelectionCandidate(normalized)) return false;
+    const stripped = stripTrailingSelectionOdds({ ...row, text: normalized }, summaryOdds, documentWidth);
+    if (stripped.text) values.push(stripped.text);
+    return stripped.removed;
+  };
+
+  const inline = clean(rows[labelIndex].text.replace(OUTCOME_LABEL, '').replace(/^\s*:?\s*/, ''));
+  if (inline && addValue(rows[labelIndex], inline)) return clean(values.join(' '));
+
+  for (let index = labelIndex + 1; index < rows.length && values.length < 5; index += 1) {
+    const row = rows[index];
+    const value = clean(row.text);
+    if (!value) continue;
+    if (RECEIPT_FIELD_LABEL.test(value) || summaryLabelRow(value) || positionedNoiseRow(value) || invalidSelectionCandidate(value) || /^\d{1,2}[.)]\s+/.test(value)) break;
+    if (/^\d{1,3}(?:(?:[.,]|\s)\d{2})$/.test(value)) break;
+    if (addValue(row, value)) break;
+  }
+
+  const selection = clean(values.join(' '));
+  return invalidSelectionCandidate(selection) ? '' : selection;
 }
 
 function likelyTeamLine(value: string) {
@@ -1022,6 +1122,38 @@ export function parsePositionedCoupon(blocks: unknown, sourceName?: string, sour
   const odds = summaryNumberFromRows(rows, /\bOdds\b/i, true);
   const stake = summaryNumberFromRows(rows, /\bInnsats\b/i);
   const payout = summaryNumberFromRows(rows, /\bMulig Premie\b/i);
+
+  const outcomeIndex = rows.findIndex((row) => OUTCOME_LABEL.test(row.text));
+  if (outcomeIndex >= 0) {
+    const labeledCompetition = positionedFieldValue(rows, /^Konkurranse\b/i);
+    const labeledMarket = positionedFieldValue(rows, /^(?:Spillobjekt|Marked)\b/i);
+    const labeledSelection = positionedOutcomeSelection(rows, odds, documentWidth);
+    const kickoffLabelIndex = rows.findIndex((row) => /^(?:Starttid|Kampstart)\b/i.test(row.text));
+    const competitionLabelIndex = rows.findIndex((row, index) => index > kickoffLabelIndex && /^Konkurranse\b/i.test(row.text));
+    const kickoffRows = kickoffLabelIndex >= 0
+      ? rows.slice(kickoffLabelIndex, competitionLabelIndex > kickoffLabelIndex ? competitionLabelIndex : kickoffLabelIndex + 3)
+      : rows;
+    const labeledKickoff = resolvePositionedKickoff(kickoffCandidateFromRows(kickoffRows), purchaseText);
+    const matchRow = rows.find((row) => /^\s*\d{1,2}[.)]\s+(?=.*[A-Za-zÆØÅæøå])/.test(row.text));
+    const labeledMatch = clean(matchRow?.text.replace(/^\s*\d{1,2}[.)]\s+/, '') || '');
+    const item = draft();
+    return reconcileDraftEconomics({
+      ...item,
+      sourceName,
+      sourcePreview,
+      groupId: coupon || item.groupId,
+      match: eventMatchFallback(labeledMatch, labeledMarket, labeledCompetition),
+      kickoff: labeledKickoff,
+      competition: labeledCompetition,
+      coupon,
+      market: labeledMarket,
+      selection: labeledSelection,
+      category: inferCategory(labeledMarket),
+      odds: String(odds || ''),
+      stake: String(stake || ''),
+      payout: String(payout || ''),
+    });
+  }
 
   const firstContentIndex = competitionHit ? competitionHit.index + 1 : Math.max(0, rows.findIndex((row) => /^singel\b/i.test(clean(row.text))) + 1);
   const contentRows = rows.slice(firstContentIndex).filter((row) =>
@@ -1089,7 +1221,7 @@ export function parsePositionedCoupon(blocks: unknown, sourceName?: string, sour
   });
 }
 
-function mergePositionedWithText(positioned: ImportDraft | null, textCandidates: ImportDraft[]) {
+export function mergePositionedWithText(positioned: ImportDraft | null, textCandidates: ImportDraft[]) {
   const fallbackCandidate = mergeDraftCandidates(textCandidates);
   const fallback = fallbackCandidate ? reconcileDraftEconomics(fallbackCandidate) : null;
   const primary = positioned ? reconcileDraftEconomics(positioned) : null;
@@ -1101,6 +1233,8 @@ function mergePositionedWithText(positioned: ImportDraft | null, textCandidates:
   const fallbackKickoff = normalizeAbsoluteKickoff(fallback.kickoff);
   const couponValid = (value: string) => /^\d{6,12}(?:\.\d+)?$/.test(clean(value));
   const market = clean(primary.market) || clean(fallback.market);
+  const primarySelection = invalidSelectionCandidate(primary.selection) ? '' : clean(primary.selection);
+  const fallbackSelection = invalidSelectionCandidate(fallback.selection) ? '' : clean(fallback.selection);
 
   const mixed = reconcileDraftEconomics({
     ...primary,
@@ -1120,7 +1254,7 @@ function mergePositionedWithText(positioned: ImportDraft | null, textCandidates:
     competition: clean(primary.competition) || (!/^Fotball-VM 2026$/i.test(clean(fallback.competition)) ? clean(fallback.competition) : ''),
     coupon: couponValid(primary.coupon) ? primary.coupon : (couponValid(fallback.coupon) ? fallback.coupon : ''),
     market,
-    selection: clean(primary.selection) || clean(fallback.selection),
+    selection: primarySelection || fallbackSelection,
     odds: economic.odds,
     stake: economic.stake,
     payout: economic.payout,
@@ -1357,7 +1491,7 @@ export function draftErrors(item: ImportDraft) {
     errors.push('Kamp/event må kontrolleres. Feltet kan ikke inneholde marked eller tidspunkt.');
   }
   if (!market || normalizedItem.market.length > 130 || /Spilt\s+utfall|Kupongnummer|Mulig\s+premie/i.test(market)) errors.push('Markedet må kontrolleres.');
-  if (!selection || normalizedItem.selection.length > 180 || suspicious.test(selection) || /\b(?:I\s*dag|I\s*morgen)\b|\d{1,2}:\d{2}|\s(?:v|vs\.?|mot)\s/i.test(selection)) {
+  if (invalidSelectionCandidate(selection) || normalizedItem.selection.length > 180 || suspicious.test(selection) || /\b(?:I\s*dag|I\s*morgen)\b|\d{1,2}:\d{2}|\s(?:v|vs\.?|mot)\s/i.test(selection)) {
     errors.push('Spillvalget må kontrolleres. Det kan ikke inneholde kamp eller tidspunkt.');
   }
   if (market && selection && receiptLineKey(market) === receiptLineKey(selection)) errors.push('Marked og spillvalg kan ikke være identiske.');
