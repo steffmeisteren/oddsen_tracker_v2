@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import { createWorker } from 'tesseract.js';
 import heroImage from '../../assets/world-cup-stadium-hero.png';
+import { resolveWorldCupTeam } from './worldCupTeams';
 import './oddsen-tracker.css';
 
 type Theme = 'dark' | 'light';
@@ -237,9 +238,34 @@ function invalidMatchCandidate(value: string) {
   return normalized.length < 3 || normalized.length > 110;
 }
 
-function eventMatchFallback(match: string, _market: string, _competition: string) {
+function comparableMatchText(value: string) {
+  return clean(value)
+    .replace(/^&\s*/, '')
+    .toLocaleLowerCase('nb-NO')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function competitionOnlyMatch(value: string, competition = '') {
+  const candidate = comparableMatchText(value);
+  if (!candidate || /\s(?:v|vs|mot)\s/i.test(candidate)) return false;
+  const competitionKey = comparableMatchText(competition);
+  if (competitionKey && (candidate === competitionKey || candidate.includes(competitionKey) || competitionKey.includes(candidate))) return true;
+  return /^(?:internasjonal|international)(?:\s|$)|\b(?:fotball\s*vm|world cup|vm 20\d{2}|champions league|europa league|premier league|spesialer)\b/i.test(candidate);
+}
+
+function headToHeadMatch(value: string) {
+  const candidate = clean(value);
+  return /\s(?:v|vs\.?|mot)\s/i.test(candidate) || /^[A-Za-zÆØÅæøåÉé.' ]+\s[-–—]\s[A-Za-zÆØÅæøåÉé.' ]+$/.test(candidate);
+}
+
+function eventMatchFallback(match: string, market: string, competition: string) {
   const candidate = clean(match);
-  return invalidMatchCandidate(candidate) ? '' : candidate;
+  if (invalidMatchCandidate(candidate)) return '';
+  if (inferCategory(market) !== 'Spesial' && competitionOnlyMatch(candidate, competition)) return '';
+  return candidate.replace(/^&\s*/, '');
 }
 
 type ReceiptHints = { match: string; market: string; selection: string; kickoff: string; competition: string };
@@ -297,8 +323,7 @@ function inferReceiptHints(text: string): ReceiptHints {
   let market = valueAfter(/^(?:Spillobjekt|Marked)\b/i);
   const outcome = outcomeSelectionFromText(normalized);
   let selection = stripTrailingReceiptOdds(outcome.value, labeledNumber(normalized, 'Odds', true));
-  const kickoff = valueAfter(/^(?:Starttid|Kampstart)\b/i);
-  const competition = valueAfter(/^Konkurranse\b/i);
+  let competition = valueAfter(/^Konkurranse\b/i);
 
   if (!market) {
     const marketIndex = lines.findIndex((line) => semanticMarketLine(line) && !receiptNoiseLine(line));
@@ -309,14 +334,34 @@ function inferReceiptHints(text: string): ReceiptHints {
     const candidates = lines.slice(Math.max(0, marketIndex + 1));
     selection = clean(candidates.find((line) => semanticSelectionLine(line)) || '');
   }
+  if (!competition) {
+    competition = clean(lines.find((line) => competitionOnlyMatch(line)) || '').replace(/^&\s*/, '');
+  }
 
   const numbered = lines.map((line) => clean(line.replace(/^\s*\d{1,2}[.)]\s*/, '')))
     .find((line) => !invalidMatchCandidate(line) && (/(?:fotball.?vm|vm\s*2026|world cup)/i.test(line) || /\s(?:v|vs\.?|mot)\s/i.test(line)));
   const versus = lines.find((line) => !invalidMatchCandidate(line) && /\s(?:v|vs\.?|mot)\s/i.test(line));
   const event = lines.find((line) => !invalidMatchCandidate(line) && /^(?:fotball.?vm|vm\s*2026|fifa world cup)/i.test(line));
+  const marketIndex = lines.findIndex((line) => semanticMarketLine(line) && !receiptNoiseLine(line));
+  const teamLines = lines.slice(0, marketIndex >= 0 ? marketIndex : lines.length)
+    .map((line) => removeKickoffCandidate(clean(line.replace(/^\s*\d{1,2}[.)]\s*/, ''))))
+    .filter((line) => likelyTeamLine(line) && !receiptNoiseLine(line) && !labelPattern.test(line));
+  const pairedTeams = teamLines.length >= 2 ? `${teamLines.at(-2)} vs ${teamLines.at(-1)}` : '';
+  const match = [versus, numbered, pairedTeams, event]
+    .map((candidate) => eventMatchFallback(candidate || '', market, competition))
+    .find(Boolean) || '';
+
+  const labeledKickoff = valueAfter(/^(?:Starttid|Kampstart)\b/i);
+  const rawKickoff = /(?:\d{1,2}[/.:-]\d{1,2}|\bI\s*(?:dag|morgen)\b)/i.test(labeledKickoff)
+    ? labeledKickoff
+    : clean(lines.find((line) => /\b(?:I\s*dag|Idag|I\s*morgen)\s*\d{1,2}[:.]\d{2}\b|\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\s+\d{1,2}[:.]\d{2}\b/i.test(line)) || '');
+  const purchase = clean(lines.find((line) => Boolean(parseCouponDateParts(line)?.year) && line !== rawKickoff) || '');
+  const kickoff = /^\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}$/.test(clean(rawKickoff))
+    ? clean(rawKickoff)
+    : (resolvePositionedKickoff(rawKickoff, purchase) || clean(rawKickoff));
 
   return {
-    match: clean(numbered || versus || event || ''),
+    match: clean(match),
     market: clean(market),
     selection: clean(selection),
     kickoff: clean(kickoff),
@@ -331,8 +376,6 @@ function looseDraftFromText(text: string, sourceName?: string, sourcePreview?: s
   const numberedMatch = clean(normalized.match(/(?:^|\n)\s*\d{1,2}[.)]\s+(?=[^\n]*[A-Za-zÆØÅæøå])([^\n]{2,100})/m)?.[1] || '');
   const inlineMatch = clean(normalized.match(/([A-ZÆØÅ][^:\n]{1,80}?\s(?:v|vs\.?|mot)\s[^:\n]{1,80}?)(?=\s+Starttid\b)/i)?.[1] || '');
   const versusLine = lines.find((line) => line.length <= 110 && /\s(?:v|vs\.?|mot)\s/i.test(line) && !/(?:odds|innsats|premie|kupong)/i.test(line));
-  const candidates = [fieldAfter(normalized, 'Kamp'), numberedMatch, inlineMatch, clean(versusLine || ''), hints.match];
-  const explicitMatch = candidates.find((value) => !invalidMatchCandidate(value)) || '';
   const market = fieldAfter(normalized, 'Spillobjekt|Marked') || hints.market;
   const odds = labeledNumber(normalized, 'Odds', true);
   const outcome = outcomeSelectionFromText(normalized);
@@ -343,6 +386,8 @@ function looseDraftFromText(text: string, sourceName?: string, sourcePreview?: s
     lines.find((line) => /(?:januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember).*\d{1,2}[:.]\d{2}/i.test(line)) || '';
   const kickoff = resolvePositionedKickoff(kickoffRaw, purchaseText) || normalizeAbsoluteKickoff(kickoffRaw);
   const competition = fieldAfter(normalized, 'Konkurranse') || hints.competition;
+  const candidates = [fieldAfter(normalized, 'Kamp'), numberedMatch, inlineMatch, clean(versusLine || ''), hints.match];
+  const explicitMatch = candidates.map((value) => eventMatchFallback(value, market, competition)).find(Boolean) || '';
   const couponRaw = normalized.match(/(?:Kupongnummer|\b(?:ID|1D|lD))\s*:?\s*([0-9][0-9., ]{5,})/i)?.[1] || '';
   const coupon = clean(couponRaw.replace(/\s/g, '').replace(/(?<=\d),(?=\d)/g, '.'));
   const stake = labeledNumber(normalized, 'Innsats');
@@ -371,12 +416,15 @@ function mergeDraftData(primary: ImportDraft, fallback: ImportDraft | null): Imp
   if (!fallback) return normalizeImportedDraft(primary);
   const emptyOr = (value: string, placeholder?: string) => !clean(value) || (placeholder ? clean(value) === placeholder : false);
   const market = emptyOr(primary.market, 'Spillmarked') ? fallback.market : primary.market;
+  const competition = emptyOr(primary.competition, 'Fotball-VM 2026') && fallback.competition !== 'Fotball-VM 2026' ? fallback.competition : primary.competition;
+  const primaryMatch = eventMatchFallback(primary.match, market, competition);
+  const fallbackMatch = eventMatchFallback(fallback.match, market, competition);
   return normalizeImportedDraft({
     ...primary,
     groupId: primary.coupon || fallback.coupon || primary.groupId,
-    match: emptyOr(primary.match, 'Importert kupong') ? fallback.match : primary.match,
+    match: emptyOr(primaryMatch, 'Importert kupong') ? fallbackMatch : primaryMatch,
     kickoff: emptyOr(primary.kickoff, 'Tidspunkt ikke oppgitt') ? fallback.kickoff : primary.kickoff,
-    competition: emptyOr(primary.competition, 'Fotball-VM 2026') && fallback.competition !== 'Fotball-VM 2026' ? fallback.competition : primary.competition,
+    competition,
     coupon: primary.coupon || fallback.coupon,
     market,
     selection: invalidSelectionCandidate(primary.selection) ? fallback.selection : primary.selection,
@@ -416,7 +464,11 @@ export function parseCouponText(rawText: string, sourceName?: string, sourcePrev
         if (legOdds > 1) selection = `${selection} · delodds ${legOdds.toFixed(2)}`;
       }
       const rawMatch = clean(section.match(/(?:^|\n)\s*\d{1,2}[.)]\s+(?=[^\n]*[A-Za-zÆØÅæøå])([^\n]{2,100})/m)?.[1] || section.match(/Kamp\s*:?\s*([^\n]+)/i)?.[1] || sectionLoose?.match || fallbackMatch);
-      const kickoff = clean(section.match(/Starttid\s*:?\s*([\s\S]*?)(?=\s*(?:Konkurranse|Spillobjekt))/i)?.[1] || section.match(/Kampstart\s*:?\s*([^\n]+)/i)?.[1] || sectionLoose?.kickoff || '');
+      const rawKickoff = clean(section.match(/Starttid\s*:?\s*([\s\S]*?)(?=\s*(?:Konkurranse|Spillobjekt))/i)?.[1] || section.match(/Kampstart\s*:?\s*([^\n]+)/i)?.[1] || '');
+      const normalizedKickoff = clean(sectionLoose?.kickoff || '');
+      const kickoff = /^\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}$/.test(normalizedKickoff)
+        ? normalizedKickoff
+        : (/^(?:\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\s+|I\s*(?:dag|morgen)\s*)\d{1,2}[:.]\d{2}$/i.test(rawKickoff) ? rawKickoff : normalizedKickoff);
       const competition = clean(section.match(/Konkurranse\s*:?\s*([\s\S]*?)(?=\s*Spillobjekt)/i)?.[1] || sectionLoose?.competition || '');
       const match = eventMatchFallback(rawMatch, market, competition);
       return mergeDraftData({ id: crypto.randomUUID(), groupId, match, kickoff, competition, coupon, category: inferCategory(market), market, selection, odds: String(odds || ''), stake, payout, sourceName, sourcePreview }, sectionLoose);
@@ -433,7 +485,7 @@ export function parseCouponText(rawText: string, sourceName?: string, sourcePrev
 
 function draftCompletenessScore(item: ImportDraft) {
   let score = 0;
-  if (!invalidMatchCandidate(item.match)) score += /\s(?:v|vs\.?|mot)\s|(?:fotball.?vm|vm\s*2026|world cup)/i.test(item.match) ? 45 : 18;
+  if (!invalidMatchCandidate(item.match) && !competitionOnlyMatch(item.match, item.competition)) score += headToHeadMatch(item.match) ? 45 : 18;
   if (clean(item.market)) score += semanticMarketLine(item.market) ? 55 : 24;
   if (!invalidSelectionCandidate(item.selection)) score += semanticSelectionLine(item.selection) ? 50 : 22;
   if (/(?:\d{1,2}[/.]\d{1,2}|\d{1,2}:\d{2})/.test(item.kickoff)) score += 18;
@@ -455,7 +507,7 @@ type DraftTextField = 'match' | 'kickoff' | 'competition' | 'coupon' | 'market' 
 function draftFieldScore(field: DraftTextField, value: string) {
   const normalized = clean(value);
   if (!normalized) return -1000;
-  if (field === 'match') return invalidMatchCandidate(normalized) ? -500 : (/(?:fotball.?vm|vm\s*2026|world cup)|\s(?:v|vs\.?|mot)\s/i.test(normalized) ? 100 : 25);
+  if (field === 'match') return invalidMatchCandidate(normalized) || competitionOnlyMatch(normalized) ? -500 : (headToHeadMatch(normalized) ? 100 : 25);
   if (field === 'market') return semanticMarketLine(normalized) ? 110 + Math.min(35, normalized.length / 3) : 20;
   if (field === 'selection') return invalidSelectionCandidate(normalized) ? -500 : (semanticSelectionLine(normalized) ? 105 + Math.min(30, normalized.length / 3) : (semanticMarketLine(normalized) ? -100 : 18));
   if (field === 'kickoff') return /(?:\d{1,2}[/.]\d{1,2}|\d{1,2}:\d{2})/.test(normalized) ? 90 : (normalized === 'Tidspunkt ikke oppgitt' ? -20 : 12);
@@ -1104,9 +1156,9 @@ function normalizeVersusMatch(value: string) {
   return parts.length === 2 ? `${parts[0]} vs ${parts[1]}` : clean(value);
 }
 
-function validPositionedMatch(value: string) {
+function validPositionedMatch(value: string, market = '', competition = '') {
   const text = clean(value);
-  return !invalidMatchCandidate(text) && !semanticMarketLine(text) && !/\b(?:I\s*dag|I\s*morgen)\b|\d{1,2}:\d{2}/i.test(text);
+  return Boolean(eventMatchFallback(text, market, competition)) && !semanticMarketLine(text) && !/\b(?:I\s*dag|I\s*morgen)\b|\d{1,2}:\d{2}/i.test(text);
 }
 
 export function parsePositionedCoupon(blocks: unknown, sourceName?: string, sourcePreview?: string): ImportDraft | null {
@@ -1199,7 +1251,7 @@ export function parsePositionedCoupon(blocks: unknown, sourceName?: string, sour
     if (teams.length >= 2) match = `${teams[0]} vs ${teams[1]}`;
   }
   if (!match) match = clean(matchRows.join(' '));
-  if (!validPositionedMatch(match)) match = '';
+  if (!validPositionedMatch(match, market, competition)) match = '';
 
   if (!match && !market && !selection && !coupon && !odds && !stake && !payout) return null;
   const item = draft();
@@ -1228,7 +1280,7 @@ export function mergePositionedWithText(positioned: ImportDraft | null, textCand
   if (!primary) return fallback ? [fallback] : [];
   if (!fallback) return [primary];
 
-  const fallbackMatch = validPositionedMatch(fallback.match) ? fallback.match : '';
+  const fallbackMatch = validPositionedMatch(fallback.match, fallback.market, fallback.competition) ? fallback.match : '';
   const primaryKickoff = normalizeAbsoluteKickoff(primary.kickoff);
   const fallbackKickoff = normalizeAbsoluteKickoff(fallback.kickoff);
   const couponValid = (value: string) => /^\d{6,12}(?:\.\d+)?$/.test(clean(value));
@@ -1249,7 +1301,7 @@ export function mergePositionedWithText(positioned: ImportDraft | null, textCand
 
   const merged: ImportDraft = {
     ...primary,
-    match: validPositionedMatch(primary.match) ? primary.match : fallbackMatch,
+    match: validPositionedMatch(primary.match, primary.market, primary.competition) ? primary.match : fallbackMatch,
     kickoff: primaryKickoff || fallbackKickoff,
     competition: clean(primary.competition) || (!/^Fotball-VM 2026$/i.test(clean(fallback.competition)) ? clean(fallback.competition) : ''),
     coupon: couponValid(primary.coupon) ? primary.coupon : (couponValid(fallback.coupon) ? fallback.coupon : ''),
@@ -1412,7 +1464,7 @@ function importedDraftCoreComplete(item: ImportDraft) {
   const odds = oddsFrom(item.odds); const stake = numberFrom(item.stake); const payout = numberFrom(item.payout);
   const economicError = odds > 1 && stake > 0 && payout > 0 ? Math.abs((odds * stake) - payout) / Math.max(1, payout) : 1;
   const match = clean(item.match); const market = clean(item.market); const selection = clean(item.selection);
-  return validPositionedMatch(match) && market.length > 1 && selection.length > 0 &&
+  return validPositionedMatch(match, market, item.competition) && market.length > 1 && selection.length > 0 &&
     !/\b(?:I\s*dag|I\s*morgen)\b|\d{1,2}:\d{2}|\s(?:v|vs\.?|mot)\s/i.test(selection) &&
     /^\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}$/.test(clean(item.kickoff)) && clean(item.competition).length > 2 &&
     /^\d{6,12}(?:\.\d+)?$/.test(clean(item.coupon)) && odds > 1 && stake > 0 && payout > 0 && economicError <= .06;
@@ -1486,9 +1538,11 @@ export function draftErrors(item: ImportDraft) {
   const match = clean(normalizedItem.match); const market = clean(normalizedItem.market); const selection = clean(normalizedItem.selection);
   const competition = clean(normalizedItem.competition); const kickoff = clean(normalizedItem.kickoff); const coupon = clean(normalizedItem.coupon);
   const suspicious = /\b(?:Spillobjekt|Spilt\s+utfall|Kupongnummer|Konkurranse|Mulig\s+premie|Innsats|Odds)\b/i;
+  const acceptedMatch = eventMatchFallback(match, market, competition);
+  const requiresHeadToHead = inferCategory(market) !== 'Spesial';
 
-  if (!match || normalizedItem.match.length > 110 || suspicious.test(match) || semanticMarketLine(match) || /\b(?:I\s*dag|I\s*morgen)\b|\d{1,2}:\d{2}/i.test(match)) {
-    errors.push('Kamp/event må kontrolleres. Feltet kan ikke inneholde marked eller tidspunkt.');
+  if (!acceptedMatch || (requiresHeadToHead && !headToHeadMatch(acceptedMatch)) || normalizedItem.match.length > 110 || suspicious.test(match) || semanticMarketLine(match) || /\b(?:I\s*dag|I\s*morgen)\b|\d{1,2}:\d{2}/i.test(match)) {
+    errors.push('Kamp/event må kontrolleres. Bruk lagene (for eksempel Frankrike vs Spania), ikke turneringsnavn, marked eller tidspunkt.');
   }
   if (!market || normalizedItem.market.length > 130 || /Spilt\s+utfall|Kupongnummer|Mulig\s+premie/i.test(market)) errors.push('Markedet må kontrolleres.');
   if (invalidSelectionCandidate(selection) || normalizedItem.selection.length > 180 || suspicious.test(selection) || /\b(?:I\s*dag|I\s*morgen)\b|\d{1,2}:\d{2}|\s(?:v|vs\.?|mot)\s/i.test(selection)) {
@@ -1518,38 +1572,16 @@ function readStoredBets(): TrackedBet[] {
   catch { return []; }
 }
 
-type CountryFlagId = 'norway' | 'england' | 'spain' | 'belgium';
-
 interface TeamPresentation {
   name: string;
   code: string;
-  flag?: CountryFlagId;
-}
-
-const teamsByName: Record<string, TeamPresentation> = {
-  norge: { name: 'Norge', code: 'NOR', flag: 'norway' },
-  norway: { name: 'Norge', code: 'NOR', flag: 'norway' },
-  england: { name: 'England', code: 'ENG', flag: 'england' },
-  spania: { name: 'Spania', code: 'ESP', flag: 'spain' },
-  spain: { name: 'Spania', code: 'ESP', flag: 'spain' },
-  belgia: { name: 'Belgia', code: 'BEL', flag: 'belgium' },
-  belgium: { name: 'Belgia', code: 'BEL', flag: 'belgium' },
-};
-
-function teamKey(name: string) {
-  return name
-    .trim()
-    .toLocaleLowerCase('nb-NO')
-    .replace(/æ/g, 'ae')
-    .replace(/ø/g, 'o')
-    .replace(/å/g, 'a')
-    .replace(/[^a-z0-9]/g, '');
+  flagCode?: string;
 }
 
 function presentTeam(name: string): TeamPresentation {
   const trimmedName = name.trim();
-  const known = teamsByName[teamKey(trimmedName)];
-  if (known) return known;
+  const known = resolveWorldCupTeam(trimmedName);
+  if (known) return { ...known, flagCode: known.code };
 
   return {
     name: trimmedName,
@@ -1589,35 +1621,10 @@ function kickoffPresentation(value: string) {
   };
 }
 
-function CountryFlag({ id }: { id: CountryFlagId }) {
+function CountryFlag({ code }: { code: string }) {
   return (
     <span className="country-flag" aria-hidden="true">
-      {id === 'norway' && (
-        <svg viewBox="0 0 24 16" focusable="false">
-          <rect width="24" height="16" fill="#ba0c2f" />
-          <path d="M0 8h24M9 0v16" stroke="#fff" strokeWidth="5" />
-          <path d="M0 8h24M9 0v16" stroke="#00205b" strokeWidth="2.5" />
-        </svg>
-      )}
-      {id === 'england' && (
-        <svg viewBox="0 0 24 16" focusable="false">
-          <rect width="24" height="16" fill="#fff" />
-          <path d="M0 8h24M12 0v16" stroke="#ce1124" strokeWidth="3.2" />
-        </svg>
-      )}
-      {id === 'spain' && (
-        <svg viewBox="0 0 24 16" focusable="false">
-          <rect width="24" height="16" fill="#aa151b" />
-          <rect y="4" width="24" height="8" fill="#f1bf00" />
-        </svg>
-      )}
-      {id === 'belgium' && (
-        <svg viewBox="0 0 24 16" focusable="false">
-          <rect width="8" height="16" fill="#111" />
-          <rect x="8" width="8" height="16" fill="#fdda24" />
-          <rect x="16" width="8" height="16" fill="#ef3340" />
-        </svg>
-      )}
+      <img src={`${import.meta.env.BASE_URL}flags/world-cup-2026/${code}.svg`} alt="" />
     </span>
   );
 }
@@ -1994,14 +2001,14 @@ export function OddsenTracker() {
                     ) : (
                       <h2 className="match-versus" aria-label={`${matchup.home.name} mot ${matchup.away.name}`}>
                         <span className="match-team">
-                          {matchup.home.flag && <CountryFlag id={matchup.home.flag} />}
+                          {matchup.home.flagCode && <CountryFlag code={matchup.home.flagCode} />}
                           <span className="team-wordmark">
                             <b>{matchup.home.code}</b>
                           </span>
                         </span>
                         <i aria-hidden="true">VS</i>
                         <span className="match-team">
-                          {matchup.away.flag && <CountryFlag id={matchup.away.flag} />}
+                          {matchup.away.flagCode && <CountryFlag code={matchup.away.flagCode} />}
                           <span className="team-wordmark">
                             <b>{matchup.away.code}</b>
                           </span>

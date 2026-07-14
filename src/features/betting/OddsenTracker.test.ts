@@ -210,4 +210,46 @@ Kupongnummer: 299681641.1`);
     const [item] = parseCouponText('Kamp: Spania v Belgia Spillobjekt: Tidspunkt for mål\nMarked: Kampvinner\nUtfall: Spilt utfall Odds: 11.50 Kupongnummer: 1\nOdds: 11.50\nInnsats: 300\nMulig premie: 1150');
     expect(draftErrors(item).length).toBeGreaterThan(0);
   });
+
+  it('rekonstruerer mobil-OCR med turneringslinje og separate lagnavn', () => {
+    const [item] = parseCouponText(`Singel
+Internasjonal - Fotball-VM
+Frankrike
+Spania
+I dag 21:00
+Scorer mål
+Kylian Mbappe 2.10
+Odds 2.10
+Innsats 500 kr
+Mulig premie 1 050 kr
+Dato 14. juli 2026, 15:34
+ID 301648248.1`);
+
+    expect(item).toMatchObject({
+      match: 'Frankrike vs Spania',
+      kickoff: '14.07.2026 21:00',
+      market: 'Scorer mål',
+      selection: 'Kylian Mbappe',
+      odds: '2.1',
+      stake: '500',
+      payout: '1050',
+      coupon: '301648248.1',
+    });
+    expect(draftErrors(item)).toEqual([]);
+  });
+
+  it('avviser turneringsnavnet som kamp for vanlige markeder', () => {
+    const [item] = parseCouponText(`Kamp: & Internasjonal - Fotball-VM
+Starttid: 14.07.2026 21:00
+Konkurranse: Internasjonal - Fotball-VM
+Marked: Scorer mål
+Utfall: Kylian Mbappe
+Odds: 2.10
+Innsats: 500
+Mulig premie: 1050
+Kupongnummer: 301648248.1`);
+
+    expect(item.match).toBe('');
+    expect(draftErrors(item)).toContainEqual(expect.stringContaining('Bruk lagene'));
+  });
 });
