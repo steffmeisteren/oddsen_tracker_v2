@@ -396,8 +396,8 @@ button { cursor: pointer; }
 .match-kickoff strong { color: #fff; font: 800 18px/1 var(--font-display); font-variant-numeric: tabular-nums; }
 .match-versus { width: fit-content; max-width: 100%; display: grid; grid-template-columns: minmax(0, auto) 36px minmax(0, auto); align-items: center; gap: 10px; margin: 12px 0 0; }
 .match-team { min-width: 132px; display: flex; align-items: center; justify-content: center; gap: 11px; padding: 11px 14px; border: 1px solid rgba(255, 255, 255, .24); border-radius: 11px; background: rgba(3, 18, 17, .5); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .06); backdrop-filter: blur(8px); }
-.country-flag { width: 34px; aspect-ratio: 3 / 2; flex: 0 0 auto; overflow: hidden; border: 1px solid rgba(255, 255, 255, .42); border-radius: 4px; background: rgba(255, 255, 255, .9); box-shadow: 0 5px 14px rgba(0, 0, 0, .26); }
-.country-flag svg { width: 100%; height: 100%; display: block; }
+.country-flag { width: 34px; aspect-ratio: 4 / 3; flex: 0 0 auto; overflow: hidden; border: 1px solid rgba(255, 255, 255, .42); border-radius: 4px; background: rgba(255, 255, 255, .9); box-shadow: 0 5px 14px rgba(0, 0, 0, .26); }
+.country-flag img { width: 100%; height: 100%; display: block; object-fit: cover; }
 .team-wordmark { min-width: 0; display: flex; align-items: center; }
 .team-wordmark b { color: #fff; font: 900 32px/.9 var(--font-display); letter-spacing: -.025em; }
 .match-versus i { color: #fff; font: 900 14px/1 var(--font-display); font-style: normal; letter-spacing: .06em; text-align: center; text-transform: uppercase; text-shadow: 0 2px 10px rgba(0, 0, 0, .34); }
