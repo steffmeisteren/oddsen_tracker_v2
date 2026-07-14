@@ -293,6 +293,8 @@ button { cursor: pointer; }
 .overview-copy h2 { margin: 7px 0 0; font: 900 clamp(38px, 4vw, 50px)/.95 var(--font-display); letter-spacing: -.035em; text-transform: uppercase; }
 .overview-copy h2 em { color: var(--lime); font-style: normal; }
 .overview-copy p { max-width: 620px; margin: 12px 0 18px; color: var(--muted); font-size: var(--type-body); line-height: 1.5; }
+.overview-summary { min-width: 0; display: grid; gap: 10px; }
+.overview-summary .delete-all-button { justify-self: end; }
 .overview-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .primary-button {
   min-height: 43px;
@@ -507,10 +509,6 @@ button { cursor: pointer; }
 .match-footer { display: flex; align-items: baseline; justify-content: flex-end; gap: 8px; padding: 12px 18px; border-top: 1px solid color-mix(in srgb, var(--card-line) 76%, transparent); background: var(--card-soft); color: var(--ink-muted); font-size: 13px; }
 .match-footer strong { color: var(--positive-text); font: 800 17px/1 var(--font-display); font-variant-numeric: tabular-nums; }
 
-.workspace-danger-zone { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 16px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 14px; background: color-mix(in srgb, var(--surface) 82%, transparent); }
-.workspace-danger-zone > div { display: grid; gap: 4px; }
-.workspace-danger-zone strong { font-size: 15px; }
-.workspace-danger-zone span { color: var(--muted); font-size: 13px; line-height: 1.45; }
 .delete-all-button { min-height: 40px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 0 13px; border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--line)); border-radius: 9px; background: transparent; color: var(--danger); font-size: 13px; font-weight: 750; }
 .delete-all-button:hover { border-color: color-mix(in srgb, var(--danger) 65%, var(--line)); background: color-mix(in srgb, var(--danger) 9%, transparent); }
 .delete-all-button:focus-visible, .match-delete-button:focus-visible { outline: 3px solid color-mix(in srgb, var(--danger) 50%, white); outline-offset: 2px; }
@@ -609,7 +607,7 @@ button { cursor: pointer; }
 .review-grid label { min-width: 0; display: grid; gap: 6px; color: var(--muted); font-size: var(--type-label); font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
 .review-grid label.wide { grid-column: span 2; }
 .review-grid input, .review-grid select, .review-grid textarea { width: 100%; min-height: 46px; padding: 0 10px; border: 1px solid var(--line); border-radius: 7px; outline: none; background: var(--surface-raised); color: var(--text); font: inherit; font-size: 15px; text-transform: none; }
-.review-grid textarea { min-height: 58px; padding-block: 9px; line-height: 1.35; resize: vertical; }
+.review-grid textarea { height: 46px; min-height: 46px; padding-block: 9px; line-height: 1.35; overflow-y: auto; resize: none; }
 .review-grid input:focus, .review-grid select:focus, .review-grid textarea:focus { border-color: var(--lime); }
 .review-errors { display: grid; gap: 4px; margin: 0 12px 12px; padding: 10px 12px 10px 27px; border: 1px solid color-mix(in srgb, var(--danger) 28%, transparent); border-radius: 8px; background: color-mix(in srgb, var(--danger) 7%, transparent); color: color-mix(in srgb, var(--danger) 80%, var(--text)); font-size: 13px; line-height: 1.45; }
 .import-footer { position: sticky; z-index: 5; bottom: 0; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 20px max(12px, env(safe-area-inset-bottom)); border-top: 1px solid var(--line); background: color-mix(in srgb, var(--surface-solid) 96%, transparent); box-shadow: 0 -14px 34px rgba(0, 8, 11, .24); backdrop-filter: blur(14px); }
@@ -715,7 +713,6 @@ button { cursor: pointer; }
   .bet-odds strong { font-size: 20px; }
   .bet-payout small { max-width: 100%; white-space: normal; }
   .match-footer { flex-wrap: wrap; }
-  .workspace-danger-zone { align-items: stretch; flex-direction: column; }
   .delete-all-button { width: 100%; }
   .add-dialog form { grid-template-columns: 1fr; }
   .add-dialog .wide { grid-column: auto; }
@@ -756,7 +753,7 @@ button { cursor: pointer; }
   .review-grid label:nth-child(2), .review-grid label:nth-child(3) { grid-column: 1 / -1; }
   .review-grid label { gap: 4px; }
   .review-grid input, .review-grid select, .review-grid textarea { min-width: 0; min-height: 44px; padding-inline: 9px; font-size: 14px; }
-  .review-grid textarea { min-height: 56px; padding-block: 8px; }
+  .review-grid textarea { height: 44px; min-height: 44px; padding-block: 8px; }
   .review-errors { gap: 2px; margin: 0 10px 10px; padding: 8px 9px 8px 24px; font-size: 11px; line-height: 1.35; }
   .import-error { margin-top: 9px; padding: 8px 10px; font-size: 12px; }
   .import-footer { display: flex; flex-direction: column; align-items: stretch; gap: 7px; padding: 9px 12px max(9px, env(safe-area-inset-bottom)); }

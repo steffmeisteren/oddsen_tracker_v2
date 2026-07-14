@@ -15,6 +15,12 @@ endring kan godkjennes; et preview- eller thumbnail-bilde er ikke en gyldig kild
 | `3135.jpg` | `Screenshot_20260714_153747.jpg` | `301646585.1` |
 | `special-event-norway-world-cup.jpg` | `Screenshot_20260711_221654.jpg` | `299102132.1` |
 
+`Testkuponger.jpg` er det uendrede bulkbildet med ti kort (SHA-256
+`c7b17ba9d450c1a7ab3ad400c0bd6d5054a5008bf99ed64adf7097bce474dfa1`).
+Fixturetesten dekoder hele JPEG-filen og sender de faktiske pikslene gjennom
+produksjonens `detectCouponBoxes`. Den forventer tre komplette rader og én
+ufullstendig siste rad (`3 + 3 + 3 + 1`) i stabil leserekkefølge.
+
 De fire nummererte filene skal beholde denne rekkefølgen også når OCR-jobbene
 fullføres i en annen rekkefølge. Alle fire bruker kvitteringsdatoen 14. juli 2026
 som referanse for `I dag 21:00`. Spesialeventet dokumenterer at et gyldig event uten
