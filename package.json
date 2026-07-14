@@ -25,6 +25,7 @@
     "@types/react-dom": "latest",
     "eslint": "latest",
     "globals": "latest",
+    "jpeg-js": "^0.4.4",
     "typescript-eslint": "latest",
     "vitest": "latest"
   }

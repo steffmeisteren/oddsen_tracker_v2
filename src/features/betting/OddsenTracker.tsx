@@ -150,16 +150,39 @@ function normalizeOcrText(rawText: string) {
     .replace(/sp[i1l|!]{1,3}\s*[o0]b[jyi1l|!]*[e3]k[t7l|!]/gi, 'Spillobjekt')
     .replace(/sp[i1l|!]{1,3}[t7l|!]?\s*u[t7l|!][fph][a-zæøå0-9|!]*/gi, 'Spilt utfall')
     .replace(/sp[i1l|!]{1,3}\s*v[a4]lg/gi, 'Spillvalg')
-    .replace(/kupong\s*(?:nummer|numm?er|nr\.?)/gi, 'Kupongnummer')
+    .replace(/\bkupong\s*(?:num(?:m{0,2}|in)er\b|nr\b\.?)\s*[:.]?/gi, 'Kupongnummer:')
     .replace(/\s+(?=(?:Innsats|Odds|Mulig Premie|Starttid|Kampstart|Konkurranse|Spillobjekt|Spilt utfall|Levert|Kupongnummer)\s*:)/gi, '\n')
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n');
 }
 
 const OCR_FIELD_NAMES = 'Innsats|Odds|Mulig Premie|Starttid|Kampstart|Konkurranse|Spillobjekt|Marked|Spilt utfall|Utfall|Spillvalg|Levert|Kupongnummer';
+const COMPETITION_TRAILING_FIELD_NAMES = 'Spillobjekt|Marked|Spilt utfall|Spill utfall|Utfall|Spillvalg|Levert|Kupongnummer';
 const OUTCOME_LABEL = /^(?:Spilt\s*utfall|Spill\s*utfall|Utfall|Spillvalg)\b/i;
 const RECEIPT_FIELD_LABEL = /^(?:Innsats|Odds|Mulig Premie|Starttid|Kampstart|Konkurranse|Spillobjekt|Marked|Spilt\s*utfall|Spill\s*utfall|Utfall|Spillvalg|Levert|Kupongnummer)\b/i;
 const RECEIPT_METADATA_WORDS = /\b(?:Singel|System|Aktiv|Levert)\b/i;
+
+function normalizeCompetitionValue(value: string) {
+  const normalized = clean(value);
+  const boundary = normalized.search(new RegExp(`\\s+(?=(?:${COMPETITION_TRAILING_FIELD_NAMES})\\b\\s*:?)`, 'i'));
+  const competition = boundary >= 0 ? normalized.slice(0, boundary) : normalized;
+  return clean(competition.replace(/\bfotball\s*[-–—]?\s*vm\b/gi, 'Fotball-VM'));
+}
+
+function normalizeCouponNumber(value: string) {
+  const normalized = clean(value)
+    .replace(/[|]/g, ' ')
+    .replace(/(?<=\d)\s*[,.]\s*(?=\d)/g, '.');
+  if (!normalized) return '';
+
+  if (!normalized.includes('.')) {
+    const separatedSuffix = normalized.match(/^([0-9][0-9 ]*[0-9])\s+([0-9]{1,2})$/);
+    const base = separatedSuffix?.[1].replace(/\s/g, '') || '';
+    if (/^\d{6,12}$/.test(base)) return `${base}.${separatedSuffix?.[2]}`;
+  }
+
+  return normalized.replace(/\s/g, '');
+}
 
 function fieldAfter(text: string, label: string) {
   const match = text.match(new RegExp(`(?:^|\\n|\\s)(?:${label})\\b\\s*:?\\s*([\\s\\S]*?)(?=(?:\\n|\\s)+(?:${OCR_FIELD_NAMES})\\b\\s*:?|$)`, 'i'));
@@ -439,7 +462,7 @@ function looseDraftFromText(text: string, sourceName?: string, sourcePreview?: s
   const candidates = [fieldAfter(normalized, 'Kamp'), numberedMatch, inlineMatch, clean(versusLine || ''), hints.match];
   const explicitMatch = candidates.map((value) => eventMatchFallback(value, market, competition)).find(Boolean) || '';
   const couponRaw = normalized.match(/(?:Kupongnummer|\b(?:ID|1D|lD))\s*:?\s*([0-9][0-9., ]{5,})/i)?.[1] || '';
-  const coupon = clean(couponRaw.replace(/\s/g, '').replace(/(?<=\d),(?=\d)/g, '.'));
+  const coupon = normalizeCouponNumber(couponRaw);
   const stake = labeledNumber(normalized, 'Innsats');
   const payout = labeledNumber(normalized, 'Mulig Premie');
   if (!explicitMatch && !market && !selection && !stake && !odds && !payout && !coupon) return null;
@@ -497,7 +520,7 @@ export function parseCouponText(rawText: string, sourceName?: string, sourcePrev
     const block = text.slice(blockStart, summaries[index + 1]?.index ?? text.length);
     const purchaseReference = purchaseReferenceFromTextLines(block.split('\n'));
     const loose = looseDraftFromText(block, sourceName, sourcePreview);
-    const coupon = clean(block.match(/Kupongnummer\s*:?\s*([0-9. ]+)/i)?.[1]?.replace(/\s/g, '') || loose?.coupon || '');
+    const coupon = normalizeCouponNumber(block.match(/Kupongnummer\s*:?\s*([0-9., ]+)/i)?.[1] || loose?.coupon || '');
     const groupId = coupon || crypto.randomUUID();
     const stake = String(numberFrom(summary[1]) || loose?.stake || '');
     const payout = String(numberFrom(summary[3]) || loose?.payout || '');
@@ -655,6 +678,24 @@ function mergeNearby(items: Array<{ start: number; end: number }>, gap: number) 
   }, []);
 }
 
+function splitMergedColumnRuns(columns: Array<{ start: number; end: number }>, imageWidth: number) {
+  if (columns.length < 2) return columns;
+  const widths = columns.map((column) => column.end - column.start).filter((width) => width > 0);
+  const referenceWidth = Math.min(...widths);
+  if (referenceWidth < imageWidth * .16) return columns;
+
+  return columns.flatMap((column) => {
+    const width = column.end - column.start;
+    const count = Math.max(1, Math.round(width / referenceWidth));
+    const cellWidth = width / count;
+    if (count < 2 || Math.abs(cellWidth - referenceWidth) > referenceWidth * .18) return [column];
+    return Array.from({ length: count }, (_, index) => ({
+      start: Math.round(column.start + (width * index) / count),
+      end: Math.round(column.start + (width * (index + 1)) / count),
+    }));
+  });
+}
+
 function isPaper(data: Uint8ClampedArray, offset: number) {
   const r = data[offset]; const g = data[offset + 1]; const b = data[offset + 2];
   return r > 242 && g > 242 && b > 242 && Math.max(r, g, b) - Math.min(r, g, b) < 22;
@@ -671,6 +712,7 @@ export function detectCouponBoxes(image: PixelImage): CouponBox[] {
   });
   let columns = mergeNearby(runs(columnScores, (score) => score > .055, Math.max(18, Math.floor(width * .11))), 0);
   if (!columns.length) columns = [{ start: 0, end: width }];
+  columns = splitMergedColumnRuns(columns, width);
 
   const boxes = columns.flatMap((column) => {
     const xStart = Math.max(0, column.start + Math.floor((column.end - column.start) * .015));
@@ -1072,9 +1114,9 @@ function summaryNumberFromRows(rows: PositionedOcrRow[], label: RegExp, isOdds =
 
 function couponNumberFromRows(rows: PositionedOcrRow[]) {
   for (const row of [...rows].reverse()) {
-    const normalized = row.text.replace(/[|]/g, ' ').replace(/(?<=\d),(?=\d)/g, '.');
+    const normalized = normalizeOcrText(row.text).replace(/[|]/g, ' ').replace(/(?<=\d),(?=\d)/g, '.');
     const match = normalized.match(/\b(?:Kupongnummer|ID|1D|lD|I0)\s*[:.]?\s*([0-9][0-9 .]{5,}(?:\.[0-9]+)?)/i);
-    const coupon = clean((match?.[1] || '').replace(/\s/g, ''));
+    const coupon = normalizeCouponNumber(match?.[1] || '');
     if (/^\d{6,12}(?:\.\d+)?$/.test(coupon)) return coupon;
   }
   return '';
@@ -1353,7 +1395,7 @@ export function parsePositionedCoupon(blocks: unknown, sourceName?: string, sour
   const summaryRows = rows.filter((row) => summaryLabelRow(row.text));
   const summaryStartY = summaryRows.length ? Math.min(...summaryRows.map((row) => row.bbox.y0)) : Number.POSITIVE_INFINITY;
   const competitionHit = competitionCandidate(rows, summaryStartY);
-  const competition = clean(competitionHit?.text || '');
+  const competition = normalizeCompetitionValue(competitionHit?.text || '');
   const purchaseText = purchaseDateFromRows(rows);
   const coupon = couponNumberFromRows(rows);
   const odds = summaryNumberFromRows(rows, /\bOdds\b/i, true);
@@ -1362,7 +1404,7 @@ export function parsePositionedCoupon(blocks: unknown, sourceName?: string, sour
 
   const outcomeIndex = rows.findIndex((row) => OUTCOME_LABEL.test(row.text));
   if (outcomeIndex >= 0) {
-    const labeledCompetition = positionedFieldValue(rows, /^Konkurranse\b/i);
+    const labeledCompetition = normalizeCompetitionValue(positionedFieldValue(rows, /^Konkurranse\b/i));
     const labeledMarket = positionedFieldValue(rows, /^(?:Spillobjekt|Marked)\b/i);
     const labeledSelection = positionedOutcomeSelection(rows, odds, documentWidth);
     const kickoffLabelIndex = rows.findIndex((row) => /^(?:Starttid|Kampstart)\b/i.test(row.text));
@@ -1703,7 +1745,8 @@ function normalizeImportedDraft(item: ImportDraft) {
   return {
     ...item,
     kickoff: normalizedKickoff || clean(item.kickoff),
-    coupon: clean(item.coupon).replace(/\s/g, '').replace(/(?<=\d),(?=\d)/g, '.'),
+    competition: normalizeCompetitionValue(item.competition),
+    coupon: normalizeCouponNumber(item.coupon),
     odds: clean(item.odds),
     stake: clean(item.stake),
     payout: clean(item.payout),
@@ -2244,7 +2287,10 @@ export function OddsenTracker() {
 
         {bets.length > 0 && <section className="overview-card" aria-labelledby="overview-title">
           <div className="overview-copy"><span className="section-kicker">Oversikt</span><h2 id="overview-title">Mine <em>spill</em></h2><p>Følg innsats, odds og mulig premie per kamp. Marker spill for å bygge en kampkupong.</p></div>
-          <dl className="overview-stats"><div><dt>Kuponger</dt><dd>{totals.coupons}</dd></div><div><dt>Total innsats</dt><dd>{money.format(totals.stake)} kr</dd></div><div><dt>Høyeste mulige premie</dt><dd>{money.format(bets.reduce((max, bet) => Math.max(max, bet.payout), 0))} kr</dd></div><div><dt>Gjennomsnittlig odds</dt><dd>{totals.averageOdds ? totals.averageOdds.toFixed(2) : '—'}</dd></div></dl>
+          <div className="overview-summary">
+            <dl className="overview-stats"><div><dt>Kuponger</dt><dd>{totals.coupons}</dd></div><div><dt>Total innsats</dt><dd>{money.format(totals.stake)} kr</dd></div><div><dt>Høyeste mulige premie</dt><dd>{money.format(bets.reduce((max, bet) => Math.max(max, bet.payout), 0))} kr</dd></div><div><dt>Gjennomsnittlig odds</dt><dd>{totals.averageOdds ? totals.averageOdds.toFixed(2) : '—'}</dd></div></dl>
+            <button className="delete-all-button" type="button" onClick={() => { if (window.confirm(`Slett alle spill og kuponger?\n\nDette fjerner ${matchGroups.length} kampkort, ${bets.length} spillvalg og ${totals.coupons} kuponger.\n\nHandlingen kan ikke angres.`)) removeAllGamesAndCoupons(); }}><Trash2 size={17} /> Slett alle spill og kuponger</button>
+          </div>
         </section>}
 
         {bets.length > 0 && <>
@@ -2421,7 +2467,6 @@ export function OddsenTracker() {
               </section>
             );
           })}
-          <section className="workspace-danger-zone" aria-label="Administrer spill og kuponger"><div><strong>Slett alle kuponger</strong><span>Fjerner {matchGroups.length} {matchGroups.length === 1 ? 'kamp' : 'kamper'}, {bets.length} spillvalg og {totals.coupons} kuponger fra denne nettleseren.</span></div><button className="delete-all-button" type="button" onClick={() => { if (window.confirm(`Slett alle spill og kuponger?\n\nDette fjerner ${matchGroups.length} kampkort, ${bets.length} spillvalg og ${totals.coupons} kuponger.\n\nHandlingen kan ikke angres.`)) removeAllGamesAndCoupons(); }}><Trash2 size={17} /> Slett alle spill og kuponger</button></section>
         </>}
       </main>
 
@@ -2440,7 +2485,7 @@ export function OddsenTracker() {
               return <article className={`review-card ${errors.length ? 'is-invalid' : 'is-valid'}`} key={item.id}>
                 <div className="review-card-head"><strong>Spillvalg {index + 1}</strong><span>{item.sourceName || 'Manuelt registrert'}</span><em>{errors.length ? `${errors.length} feil` : 'Klar'}</em><button type="button" onClick={() => setDrafts((all) => all.filter((row) => row.id !== item.id))} aria-label={`Fjern spillvalg ${index + 1}`}><Trash2 size={15} /></button></div>
                 {item.sourcePreview && <img className="review-preview" src={item.sourcePreview} alt={`Bildeutdrag for spillvalg ${index + 1}`} />}
-                <div className="review-grid"><label className="wide">Kamp<input value={item.match} onChange={(event) => updateDraft(item.id, 'match', event.target.value)} placeholder="Norge vs England" /></label><label>Starttid<input value={item.kickoff} onChange={(event) => updateDraft(item.id, 'kickoff', event.target.value)} placeholder="DD.MM.YYYY HH:MM" /></label><label>Turnering<textarea rows={2} value={item.competition} onChange={(event) => updateDraft(item.id, 'competition', event.target.value)} /></label><label className="wide">Marked<input value={item.market} onChange={(event) => updateDraft(item.id, 'market', event.target.value)} /></label><label className="wide">Spillvalg<input value={item.selection} onChange={(event) => updateDraft(item.id, 'selection', event.target.value)} /></label><label>Odds<input inputMode="decimal" value={item.odds} onChange={(event) => updateDraft(item.id, 'odds', event.target.value)} /></label><label>Innsats<input inputMode="decimal" value={item.stake} onChange={(event) => updateDraft(item.id, 'stake', event.target.value)} /></label><label>Mulig premie<input inputMode="decimal" value={item.payout} onChange={(event) => updateDraft(item.id, 'payout', event.target.value)} /></label><label>Kategori<select value={item.category} onChange={(event) => updateDraft(item.id, 'category', event.target.value)}>{CATEGORIES.slice(1).map((category) => <option key={category}>{category}</option>)}</select></label><label className="wide">Kupongnummer<input value={item.coupon} onChange={(event) => updateDraft(item.id, 'coupon', event.target.value)} /></label></div>
+                <div className="review-grid"><label className="wide">Kamp<input value={item.match} onChange={(event) => updateDraft(item.id, 'match', event.target.value)} placeholder="Norge vs England" /></label><label>Starttid<input value={item.kickoff} onChange={(event) => updateDraft(item.id, 'kickoff', event.target.value)} placeholder="DD.MM.YYYY HH:MM" /></label><label>Turnering<textarea rows={1} value={item.competition} onChange={(event) => updateDraft(item.id, 'competition', event.target.value)} /></label><label className="wide">Marked<input value={item.market} onChange={(event) => updateDraft(item.id, 'market', event.target.value)} /></label><label className="wide">Spillvalg<input value={item.selection} onChange={(event) => updateDraft(item.id, 'selection', event.target.value)} /></label><label>Odds<input inputMode="decimal" value={item.odds} onChange={(event) => updateDraft(item.id, 'odds', event.target.value)} /></label><label>Innsats<input inputMode="decimal" value={item.stake} onChange={(event) => updateDraft(item.id, 'stake', event.target.value)} /></label><label>Mulig premie<input inputMode="decimal" value={item.payout} onChange={(event) => updateDraft(item.id, 'payout', event.target.value)} /></label><label>Kategori<select value={item.category} onChange={(event) => updateDraft(item.id, 'category', event.target.value)}>{CATEGORIES.slice(1).map((category) => <option key={category}>{category}</option>)}</select></label><label className="wide">Kupongnummer<input value={item.coupon} onChange={(event) => updateDraft(item.id, 'coupon', event.target.value)} /></label></div>
                 {errors.length > 0 && <ul className="review-errors">{errors.map((error) => <li key={error}>{error}</li>)}</ul>}
               </article>;
             })}</div>

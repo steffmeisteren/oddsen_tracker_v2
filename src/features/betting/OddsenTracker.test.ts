@@ -148,6 +148,30 @@ Kupongnummer: 29968164.1`);
     expect(draftErrors(item)).toEqual([]);
   });
 
+  it('retter OCR-kupongnummer når etiketten og desimalpunktet feilleses', () => {
+    const rawText = `Innsats: 300,00
+Odds: 4.20
+Mulig Premie: 1260,00
+1. Spania v Belgia
+Starttid: Fre. 10/7 21:00
+Konkurranse: Internasjonal - Fotball-VM
+Spillobjekt: HUB og antall mål
+Spilt utfall: Spania og Under 2.5 mål
+Levert: 10.07.2026, kl. 00:27:21
+Kupongnuminer: 299681614.1`;
+    const line = (text: string, y: number) => ({ text, bbox: { x0: 20, y0: y, x1: 280, y1: y + 10 } });
+    const positioned = parsePositionedCoupon([{ paragraphs: [{ lines: rawText.split('\n').map((text, index) => line(text, index * 20)) }] }]);
+    const textCandidates = parseCouponText(rawText);
+    const [merged] = mergePositionedWithText(positioned, textCandidates);
+    const [binary] = parseCouponText(rawText.replace('Kupongnuminer: 299681614.1', 'Kupongnuminer. 299681614 1'));
+
+    expect(positioned?.coupon).toBe('299681614.1');
+    expect(textCandidates[0].coupon).toBe('299681614.1');
+    expect(binary.coupon).toBe('299681614.1');
+    expect(merged.coupon).toBe('299681614.1');
+    expect(draftErrors(merged)).toEqual([]);
+  });
+
   it('bygger ti separate kupongceller fra OCR-ankere i et 2 × 5-rutenett', () => {
     const lines = Array.from({ length: 5 }, (_, row) => [100, 300].map((x) => ({
       text: 'Kupongnummer', bbox: { x0: x - 25, y0: 80 + row * 150, x1: x + 25, y1: 95 + row * 150 },
@@ -191,7 +215,7 @@ Kupongnummer: 29968164.1`);
       line('Spania og Under 2.5 mål', 250, 20, 190),
       line('4.20', 250, 240, 280),
       line('Levert: 10.07.2026, kl. 00:27:21', 280),
-      line('Kupongnummer: 299681641.1', 300),
+      line('Kupongnummer: 299681614.1', 300),
     ] }] }];
 
     const result = parsePositionedCoupon(blocks);
@@ -214,10 +238,82 @@ Starttid: Fre. 10/7 21:00
 Konkurranse: Internasjonal - Fotball - VM
 Spillobjekt: HUB og antall mål
 Spillutfall: Spania og Under 2.5 mål
-Kupongnummer: 299681641.1`);
+Kupongnummer: 299681614.1`);
     const positionedWithHeaderSelection = result ? { ...result, selection: '> Oddsen sige Aktiv' } : null;
     const [merged] = mergePositionedWithText(positionedWithHeaderSelection, textResult);
     expect(merged).toMatchObject({ kickoff: '10.07.2026 21:00', selection: 'Spania og Under 2.5 mål' });
+  });
+
+  it('skiller Spillobjekt fra turnering når PC-OCR slår feltene sammen', () => {
+    const line = (text: string, y: number, x0 = 20, x1 = 280) => ({ text, bbox: { x0, y0: y, x1, y1: y + 10 } });
+    const blocks = [{ paragraphs: [{ lines: [
+      line('Innsats: 100,00', 0),
+      line('Odds: 2.85', 20, 20, 100),
+      line('Mulig Premie: 285,00', 20, 120, 300),
+      line('1. Spania v Belgia', 60),
+      line('Starttid:', 80),
+      line('Fre. 10/7 21:00', 100),
+      line('Konkurranse:', 120),
+      line('Internasjonal - Fotball VM Spillobjekt', 140),
+      line('Belgia vinner minst en omgang', 160),
+      line('Spillutfall:', 180),
+      line('Ja', 200),
+      line('Levert: 10.07.2026, kl. 00:30:25', 220),
+      line('Kupongnummer: 299682488.1', 240),
+    ] }] }];
+
+    const positioned = parsePositionedCoupon(blocks);
+    const textCandidates = parseCouponText(`Innsats: 100,00
+Odds: 2.85
+Mulig Premie: 285,00
+1. Spania v Belgia
+Starttid: Fre. 10/7 21:00
+Konkurranse: Internasjonal - Fotball-VM
+Spillobjekt: Belgia vinner minst en omgang
+Spillutfall: Ja
+Levert: 10.07.2026, kl. 00:30:25
+Kupongnummer: 299682488.1`);
+    const [merged] = mergePositionedWithText(positioned, textCandidates);
+
+    expect(draftErrors(merged)).not.toContain('Kamp/event må kontrolleres. Bruk lagene (for eksempel Frankrike vs Spania), ikke turneringsnavn, marked eller tidspunkt.');
+    expect(merged).toMatchObject({
+      match: 'Spania vs Belgia',
+      competition: 'Internasjonal - Fotball-VM',
+      market: 'Belgia vinner minst en omgang',
+      selection: 'Ja',
+      kickoff: '10.07.2026 21:00',
+      odds: '2.85',
+      stake: '100',
+      payout: '285',
+      coupon: '299682488.1',
+    });
+    expect(draftErrors(merged)).toEqual([]);
+
+    const persistence = validateImportForPersistence([{
+      ...merged,
+      competition: `${merged.competition} Spillobjekt ${merged.market}`,
+    }]);
+    expect(persistence.normalized[0].competition).toBe('Internasjonal - Fotball-VM');
+    expect(persistence.invalid).toEqual([]);
+    expect(persistence.ready).toHaveLength(1);
+  });
+
+  it('beholder feltord som er en legitim del av markedsteksten', () => {
+    const line = (text: string, y: number) => ({ text, bbox: { x0: 20, y0: y, x1: 280, y1: y + 10 } });
+    const result = parsePositionedCoupon([{ paragraphs: [{ lines: [
+      line('Innsats: 100,00', 0),
+      line('Odds: 2.00', 20),
+      line('Mulig Premie: 200,00', 40),
+      line('1. Spania v Belgia', 60),
+      line('Starttid: Fre. 10/7 21:00', 80),
+      line('Konkurranse: Internasjonal - Fotball-VM', 100),
+      line('Spillobjekt: Korrekt utfall', 120),
+      line('Spillutfall: Ja', 140),
+      line('Levert: 10.07.2026, kl. 00:30:25', 160),
+      line('Kupongnummer: 299682488.1', 180),
+    ] }] }]);
+
+    expect(result?.market).toBe('Korrekt utfall');
   });
 
   it('stopper sammenslått OCR-tekst og økonomiavvik', () => {
