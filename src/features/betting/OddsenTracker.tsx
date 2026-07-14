@@ -1,5 +1,5 @@
 import {
-  useEffect, useMemo, useState, type ChangeEvent, type CSSProperties, type DragEvent, type KeyboardEvent,
+  useEffect, useMemo, useRef, useState, type ChangeEvent, type CSSProperties, type DragEvent, type KeyboardEvent,
 } from 'react';
 import {
   Check, ChevronLeft, FileText, GripVertical, Image as ImageIcon, Loader2, Moon, Plus,
@@ -11,11 +11,11 @@ import { resolveWorldCupTeam } from './worldCupTeams';
 import './oddsen-tracker.css';
 
 type Theme = 'dark' | 'light';
-type Category = 'Kamp' | 'Spiller' | 'Timing' | 'Resultat' | 'Statistikk' | 'Spesial';
+export type Category = 'Kamp' | 'Spiller' | 'Timing' | 'Resultat' | 'Statistikk' | 'Spesial';
 type ImportMode = 'image' | 'text';
 type ImportStep = 'source' | 'review' | 'success';
 
-interface TrackedBet {
+export interface TrackedBet {
   id: string;
   couponGroupId: string;
   match: string;
@@ -30,7 +30,7 @@ interface TrackedBet {
   payout: number;
 }
 
-interface ImportDraft {
+export interface ImportDraft {
   id: string;
   groupId: string;
   match: string;
@@ -45,9 +45,33 @@ interface ImportDraft {
   payout: string;
   sourceName?: string;
   sourcePreview?: string;
+  sourceId?: string;
+  sourceOrder?: number;
+  regionOrder?: number;
 }
 
-interface UploadFile { file: File; url: string; }
+export interface ImportSource {
+  file: File;
+  url: string;
+  sourceId: string;
+  sourceOrder: number;
+}
+
+export function createCanonicalImportSources(
+  files: readonly File[],
+  startOrder = 0,
+  createPreviewUrl: (file: File) => string = (file) => URL.createObjectURL(file),
+): ImportSource[] {
+  return files.map((file, index) => {
+    const sourceOrder = startOrder + index;
+    return {
+      file,
+      url: createPreviewUrl(file),
+      sourceOrder,
+      sourceId: `${sourceOrder}:${file.name}:${file.size}:${file.lastModified}`,
+    };
+  });
+}
 
 const CATEGORIES: Array<'Alle' | Category> = ['Alle', 'Kamp', 'Spiller', 'Timing', 'Resultat', 'Statistikk', 'Spesial'];
 const categoryCode: Record<Category, string> = { Kamp: 'K', Spiller: 'SP', Timing: 'TID', Resultat: '1X2', Statistikk: 'STAT', Spesial: 'VIP' };
@@ -82,55 +106,18 @@ function economicRelativeError(values: EconomicValues) {
   return Math.abs((values.odds * values.stake) - values.payout) / Math.max(1, values.payout);
 }
 
-function economicScaleCandidates(value: number, kind: 'odds' | 'money') {
-  if (!(value > 0)) return [];
-  const factors = kind === 'odds' ? [1, .1, .01, 10] : [1, .1, .01];
-  return factors.map((factor) => ({
-    value: value * factor,
-    penalty: factor === 1 ? 0 : factor === .1 ? .012 : factor === .01 ? .024 : .03,
-  })).filter((candidate, index, all) => {
-    const valid = kind === 'odds' ? candidate.value > 1 && candidate.value < 1000 : candidate.value > 0 && candidate.value < 1_000_000;
-    return valid && all.findIndex((item) => Math.abs(item.value - candidate.value) < .0001) === index;
-  });
-}
-
-/**
- * Repairs common OCR separator loss without changing already coherent values.
- * Examples: 63750 -> 637.50, 2500 -> 250, 25.5 -> 2.55 when the other
- * two values prove the decimal placement through stake × odds = payout.
- */
-function reconcileEconomicValues(values: EconomicValues): EconomicValues {
-  const currentError = economicRelativeError(values);
-  if (!Number.isFinite(currentError) || currentError <= .06) return values;
-
-  let best: { values: EconomicValues; error: number; score: number } | null = null;
-  for (const odds of economicScaleCandidates(values.odds, 'odds')) {
-    for (const stake of economicScaleCandidates(values.stake, 'money')) {
-      for (const payout of economicScaleCandidates(values.payout, 'money')) {
-        const candidate = { odds: odds.value, stake: stake.value, payout: payout.value };
-        const error = economicRelativeError(candidate);
-        const score = error + odds.penalty + stake.penalty + payout.penalty;
-        if (!best || score < best.score) best = { values: candidate, error, score };
-      }
-    }
-  }
-
-  if (!best || best.error > .06 || best.score >= currentError) return values;
-  return best.values;
-}
-
 function compactDraftNumber(value: number) {
   return Number.isFinite(value) && value > 0 ? String(Number(value.toFixed(2))) : '';
 }
 
+/** Formats values parsed from OCR without inventing a different decimal scale. */
 function reconcileDraftEconomics(item: ImportDraft): ImportDraft {
-  const original = { odds: oddsFrom(item.odds), stake: numberFrom(item.stake), payout: numberFrom(item.payout) };
-  const corrected = reconcileEconomicValues(original);
+  const parsed = { odds: oddsFrom(item.odds), stake: numberFrom(item.stake), payout: numberFrom(item.payout) };
   return {
     ...item,
-    odds: compactDraftNumber(corrected.odds) || item.odds,
-    stake: compactDraftNumber(corrected.stake) || item.stake,
-    payout: compactDraftNumber(corrected.payout) || item.payout,
+    odds: compactDraftNumber(parsed.odds) || item.odds,
+    stake: compactDraftNumber(parsed.stake) || item.stake,
+    payout: compactDraftNumber(parsed.payout) || item.payout,
   };
 }
 
@@ -233,9 +220,27 @@ function labeledNumber(text: string, label: string, isOdds = false) {
 function invalidMatchCandidate(value: string) {
   const normalized = clean(value);
   if (!normalized) return true;
-  if (/^(?:oddsen|singel|aktiv|mine spill|importert kupong|tidspunkt ikke oppgitt)/i.test(normalized)) return true;
+  if (/\boddsen\b|^(?:singel|system|aktiv|mine spill|importert kupong|tidspunkt ikke oppgitt)/i.test(normalized)) return true;
   if (/\b(?:rekke|innsats|odds|mulig premie|kupongnummer|levert)\b/i.test(normalized)) return true;
   return normalized.length < 3 || normalized.length > 110;
+}
+
+const NORWEGIAN_MONTH_PATTERN = /^(?:januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember)\b/i;
+
+function numberedEventCandidate(value: string) {
+  const candidate = clean(value);
+  if (invalidMatchCandidate(candidate) || NORWEGIAN_MONTH_PATTERN.test(candidate)) return '';
+  if (/\b(?:I\s*dag|I\s*morgen)\b|\d{1,2}\s*[:.]\s*\d{2}/i.test(candidate)) return '';
+  if (Boolean(parseCouponReferenceDateParts(candidate)) || receiptNoiseLine(candidate) || semanticMarketLine(candidate)) return '';
+  if (headToHeadMatch(candidate) || /(?:fotball.?vm|world cup|vm\s*20\d{2})/i.test(candidate)) return candidate;
+  return /^[A-ZÆØÅ][A-Za-zÆØÅæøåÉé0-9 .'&()/-]{2,100}$/.test(candidate) ? candidate : '';
+}
+
+function numberedEventFromText(text: string) {
+  return normalizeOcrText(text).split('\n').map((line) => {
+    const match = clean(line).match(/^\s*\d{1,2}[.)]\s+(.*)$/);
+    return numberedEventCandidate(match?.[1] || '');
+  }).find(Boolean) || '';
 }
 
 function comparableMatchText(value: string) {
@@ -261,11 +266,50 @@ function headToHeadMatch(value: string) {
   return /\s(?:v|vs\.?|mot)\s/i.test(candidate) || /^[A-Za-zÆØÅæøåÉé.' ]+\s[-–—]\s[A-Za-zÆØÅæøåÉé.' ]+$/.test(candidate);
 }
 
+function safeMatchParticipant(value: string, competition = '') {
+  const participant = clean(value).replace(/^[^A-Za-zÆØÅæøå0-9]+|[^A-Za-zÆØÅæøå0-9.'-]+$/g, '');
+  if (!participant || participant.length > 60 || !/[A-Za-zÆØÅæøå]/.test(participant)) return '';
+  if (/(?:^|\s)[A-Za-zÆØÅæøå](?:\s|$)/.test(participant)) return '';
+  if (/^I\s*(?:dag|morgen)$/i.test(participant) || NORWEGIAN_MONTH_PATTERN.test(participant)) return '';
+  if (/\b(?:oddsen|singel|system|aktiv|levert|mine spill|profil|hjem)\b/i.test(participant)) return '';
+  if (competitionOnlyMatch(participant, competition) || semanticMarketLine(participant)) return '';
+  return participant;
+}
+
+function safeHeadToHead(value: string, competition = '') {
+  const candidate = clean(value);
+  const separator = candidate.match(/\s+(?:v|vs\.?|mot)\s+|\s[-–—]\s/i);
+  if (!separator || separator.index === undefined) return '';
+  const home = safeMatchParticipant(candidate.slice(0, separator.index), competition);
+  const away = safeMatchParticipant(candidate.slice(separator.index + separator[0].length), competition);
+  return home && away ? `${home} vs ${away}` : '';
+}
+
 function eventMatchFallback(match: string, market: string, competition: string) {
-  const candidate = clean(match);
+  const candidate = clean(match).replace(/^&\s*/, '');
   if (invalidMatchCandidate(candidate)) return '';
-  if (inferCategory(market) !== 'Spesial' && competitionOnlyMatch(candidate, competition)) return '';
-  return candidate.replace(/^&\s*/, '');
+  const headToHead = safeHeadToHead(candidate, competition);
+  if (headToHeadMatch(candidate)) return headToHead;
+  if (inferCategory(market) !== 'Spesial' || comparableMatchText(candidate) === comparableMatchText(competition)) {
+    if (competitionOnlyMatch(candidate, competition)) return '';
+  }
+  if (/\b(?:oddsen|singel|system|aktiv|levert|mine spill|profil|hjem)\b/i.test(candidate) || semanticMarketLine(candidate)) return '';
+  return candidate;
+}
+
+function matchCandidateScore(value: string, competition = '') {
+  const headToHead = safeHeadToHead(value, competition);
+  if (!headToHead) return -1000;
+  const participants = headToHead.split(' vs ').map(clean);
+  return participants.reduce((score, participant) => {
+    const knownTeam = resolveWorldCupTeam(participant);
+    const capitalized = /^[A-ZÆØÅ]/.test(participant);
+    return score + (knownTeam ? 100 : 0) + (capitalized ? 12 : 0) + Math.min(24, participant.length);
+  }, 100);
+}
+
+function bestMatchCandidate(values: string[], competition = '') {
+  return values.map(clean).filter(Boolean).sort((a, b) => matchCandidateScore(b, competition) - matchCandidateScore(a, competition))[0] || '';
 }
 
 type ReceiptHints = { match: string; market: string; selection: string; kickoff: string; competition: string };
@@ -276,7 +320,7 @@ function receiptLineKey(value: string) {
 
 function receiptNoiseLine(value: string) {
   const line = receiptLineKey(value);
-  return !line || /^(?:oddsen(?:\s+(?:singel|system|aktiv|levert))*|singel|system|aktiv|levert|vis detaljer|skjul detaljer)$/.test(line) ||
+  return !line || /\boddsen\b/.test(line) || /^(?:singel|system|aktiv|levert|vis detaljer|skjul detaljer)$/.test(line) ||
     /\b(?:rekke|innsats|odds|mulig premie|kupongnummer|levert)\b/.test(line) ||
     /^\d+(?:[.,]\d+)?(?: kr)?$/.test(line);
 }
@@ -287,10 +331,11 @@ function semanticMarketLine(value: string) {
 }
 
 function semanticSelectionLine(value: string) {
-  const line = clean(value);
+  const line = stripTrailingReceiptOdds(clean(value), 0, true);
   const key = receiptLineKey(line);
   if (!line || invalidSelectionCandidate(line) || receiptNoiseLine(line)) return false;
   if (/^(?:ja|nei|over\s+\d|under\s+\d|.+\s+og\s+(?:over|under)\s+\d|uavgjort\s*-\s*.+|[12xhub]|[a-zæøå .'-]+\s*&\s*[a-zæøå .'-]+)$/i.test(line)) return true;
+  if (/^[A-Za-zÆØÅæøåÉé.' ]+\s[-–—]\s[A-Za-zÆØÅæøåÉé.' ]+$/.test(line) || /^[A-Za-zÆØÅæøåÉé.' ]+\s\d+\s*-\s*\d+$/.test(line)) return true;
   if (semanticMarketLine(line)) return false;
   if (/\b(?:norge|england|spania|belgia|frankrike|marokko|haaland|mbapp[eé]|kane)\b/i.test(line) && !/\s(?:v|vs\.?|mot)\s/i.test(line)) return true;
   if (/^[A-ZÆØÅ][A-Za-zÆØÅæøåÉé.'-]+(?:\s+[A-ZÆØÅ][A-Za-zÆØÅæøåÉé.'-]+){0,4}$/.test(line)) return true;
@@ -334,28 +379,35 @@ function inferReceiptHints(text: string): ReceiptHints {
     const candidates = lines.slice(Math.max(0, marketIndex + 1));
     selection = clean(candidates.find((line) => semanticSelectionLine(line)) || '');
   }
+  selection = stripTrailingReceiptOdds(selection, labeledNumber(normalized, 'Odds', true), true);
   if (!competition) {
     competition = clean(lines.find((line) => competitionOnlyMatch(line)) || '').replace(/^&\s*/, '');
   }
 
-  const numbered = lines.map((line) => clean(line.replace(/^\s*\d{1,2}[.)]\s*/, '')))
-    .find((line) => !invalidMatchCandidate(line) && (/(?:fotball.?vm|vm\s*2026|world cup)/i.test(line) || /\s(?:v|vs\.?|mot)\s/i.test(line)));
+  const numbered = numberedEventFromText(normalized);
   const versus = lines.find((line) => !invalidMatchCandidate(line) && /\s(?:v|vs\.?|mot)\s/i.test(line));
   const event = lines.find((line) => !invalidMatchCandidate(line) && /^(?:fotball.?vm|vm\s*2026|fifa world cup)/i.test(line));
   const marketIndex = lines.findIndex((line) => semanticMarketLine(line) && !receiptNoiseLine(line));
+  const competitionIndex = competition ? lines.findIndex((line) => comparableMatchText(line) === comparableMatchText(competition)) : -1;
+  const specialEvent = inferCategory(market) === 'Spesial'
+    ? lines.slice(Math.max(0, competitionIndex + 1), marketIndex >= 0 ? marketIndex : lines.length)
+      .map((line) => removeKickoffCandidate(line))
+      .filter((line) => line && !receiptNoiseLine(line) && comparableMatchText(line) !== comparableMatchText(competition) && !/\b(?:I\s*dag|I\s*morgen)\b|\d{1,2}:\d{2}/i.test(line))
+      .at(-1) || ''
+    : '';
   const teamLines = lines.slice(0, marketIndex >= 0 ? marketIndex : lines.length)
     .map((line) => removeKickoffCandidate(clean(line.replace(/^\s*\d{1,2}[.)]\s*/, ''))))
     .filter((line) => likelyTeamLine(line) && !receiptNoiseLine(line) && !labelPattern.test(line));
   const pairedTeams = teamLines.length >= 2 ? `${teamLines.at(-2)} vs ${teamLines.at(-1)}` : '';
-  const match = [versus, numbered, pairedTeams, event]
+  const match = [versus, numbered, pairedTeams, specialEvent, event]
     .map((candidate) => eventMatchFallback(candidate || '', market, competition))
     .find(Boolean) || '';
 
   const labeledKickoff = valueAfter(/^(?:Starttid|Kampstart)\b/i);
   const rawKickoff = /(?:\d{1,2}[/.:-]\d{1,2}|\bI\s*(?:dag|morgen)\b)/i.test(labeledKickoff)
     ? labeledKickoff
-    : clean(lines.find((line) => /\b(?:I\s*dag|Idag|I\s*morgen)\s*\d{1,2}[:.]\d{2}\b|\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\s+\d{1,2}[:.]\d{2}\b/i.test(line)) || '');
-  const purchase = clean(lines.find((line) => Boolean(parseCouponDateParts(line)?.year) && line !== rawKickoff) || '');
+    : kickoffCandidateFromTextLines(lines);
+  const purchase = purchaseReferenceFromTextLines(lines);
   const kickoff = /^\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}$/.test(clean(rawKickoff))
     ? clean(rawKickoff)
     : (resolvePositionedKickoff(rawKickoff, purchase) || clean(rawKickoff));
@@ -373,17 +425,15 @@ function looseDraftFromText(text: string, sourceName?: string, sourcePreview?: s
   const normalized = normalizeOcrText(text);
   const lines = normalized.split('\n').map(clean).filter(Boolean);
   const hints = inferReceiptHints(normalized);
-  const numberedMatch = clean(normalized.match(/(?:^|\n)\s*\d{1,2}[.)]\s+(?=[^\n]*[A-Za-zÆØÅæøå])([^\n]{2,100})/m)?.[1] || '');
+  const numberedMatch = numberedEventFromText(normalized);
   const inlineMatch = clean(normalized.match(/([A-ZÆØÅ][^:\n]{1,80}?\s(?:v|vs\.?|mot)\s[^:\n]{1,80}?)(?=\s+Starttid\b)/i)?.[1] || '');
   const versusLine = lines.find((line) => line.length <= 110 && /\s(?:v|vs\.?|mot)\s/i.test(line) && !/(?:odds|innsats|premie|kupong)/i.test(line));
   const market = fieldAfter(normalized, 'Spillobjekt|Marked') || hints.market;
   const odds = labeledNumber(normalized, 'Odds', true);
   const outcome = outcomeSelectionFromText(normalized);
   const selection = stripTrailingReceiptOdds(outcome.value || (!outcome.foundLabel ? hints.selection : ''), odds);
-  const kickoffRaw = fieldAfter(normalized, 'Starttid|Kampstart') || hints.kickoff ||
-    normalized.match(/\b(?:I\s*dag|Idag|I\s*morgen)\s*\d{1,2}\s*[:.]\s*\d{2}\b/i)?.[0] || '';
-  const purchaseText = lines.find((line) => /\bDato\b/i.test(line)) ||
-    lines.find((line) => /(?:januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember).*\d{1,2}[:.]\d{2}/i.test(line)) || '';
+  const kickoffRaw = fieldAfter(normalized, 'Starttid|Kampstart') || hints.kickoff || kickoffCandidateFromTextLines(lines);
+  const purchaseText = purchaseReferenceFromTextLines(lines);
   const kickoff = resolvePositionedKickoff(kickoffRaw, purchaseText) || normalizeAbsoluteKickoff(kickoffRaw);
   const competition = fieldAfter(normalized, 'Konkurranse') || hints.competition;
   const candidates = [fieldAfter(normalized, 'Kamp'), numberedMatch, inlineMatch, clean(versusLine || ''), hints.match];
@@ -445,12 +495,14 @@ export function parseCouponText(rawText: string, sourceName?: string, sourcePrev
   if (summaries.length) return summaries.flatMap((summary, index): ImportDraft[] => {
     const blockStart = summaries.length === 1 ? 0 : summary.index;
     const block = text.slice(blockStart, summaries[index + 1]?.index ?? text.length);
+    const purchaseReference = purchaseReferenceFromTextLines(block.split('\n'));
     const loose = looseDraftFromText(block, sourceName, sourcePreview);
     const coupon = clean(block.match(/Kupongnummer\s*:?\s*([0-9. ]+)/i)?.[1]?.replace(/\s/g, '') || loose?.coupon || '');
     const groupId = coupon || crypto.randomUUID();
     const stake = String(numberFrom(summary[1]) || loose?.stake || '');
     const payout = String(numberFrom(summary[3]) || loose?.payout || '');
-    const markers = [...block.matchAll(/(?:^|\n)\s*\d{1,2}[.)]\s+(?=[^\n]*[A-Za-zÆØÅæøå])([^\n]{2,100})/gm)];
+    const markers = [...block.matchAll(/(?:^|\n)\s*\d{1,2}[.)]\s+(?=[^\n]*[A-Za-zÆØÅæøå])([^\n]{2,100})/gm)]
+      .filter((marker) => Boolean(numberedEventCandidate(marker[1])));
     const parseSection = (section: string, fallbackMatch = ''): ImportDraft => {
       const sectionLoose = looseDraftFromText(section, sourceName, sourcePreview) || loose;
       const market = clean(section.match(/Spillobjekt\s*:?\s*([\s\S]*?)(?=\s*Spilt\s+utfall)/i)?.[1] || section.match(/Marked\s*:?\s*([^\n]+)/i)?.[1] || sectionLoose?.market || '');
@@ -463,12 +515,12 @@ export function parseCouponText(rawText: string, sourceName?: string, sourcePrev
         const legOdds = oddsFrom(selectionOdds[1]);
         if (legOdds > 1) selection = `${selection} · delodds ${legOdds.toFixed(2)}`;
       }
-      const rawMatch = clean(section.match(/(?:^|\n)\s*\d{1,2}[.)]\s+(?=[^\n]*[A-Za-zÆØÅæøå])([^\n]{2,100})/m)?.[1] || section.match(/Kamp\s*:?\s*([^\n]+)/i)?.[1] || sectionLoose?.match || fallbackMatch);
+      const rawMatch = clean(numberedEventFromText(section) || section.match(/Kamp\s*:?\s*([^\n]+)/i)?.[1] || sectionLoose?.match || fallbackMatch);
       const rawKickoff = clean(section.match(/Starttid\s*:?\s*([\s\S]*?)(?=\s*(?:Konkurranse|Spillobjekt))/i)?.[1] || section.match(/Kampstart\s*:?\s*([^\n]+)/i)?.[1] || '');
       const normalizedKickoff = clean(sectionLoose?.kickoff || '');
       const kickoff = /^\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}$/.test(normalizedKickoff)
         ? normalizedKickoff
-        : (/^(?:\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\s+|I\s*(?:dag|morgen)\s*)\d{1,2}[:.]\d{2}$/i.test(rawKickoff) ? rawKickoff : normalizedKickoff);
+        : (resolvePositionedKickoff(rawKickoff || normalizedKickoff, purchaseReference) || normalizeAbsoluteKickoff(rawKickoff || normalizedKickoff));
       const competition = clean(section.match(/Konkurranse\s*:?\s*([\s\S]*?)(?=\s*Spillobjekt)/i)?.[1] || sectionLoose?.competition || '');
       const match = eventMatchFallback(rawMatch, market, competition);
       return mergeDraftData({ id: crypto.randomUUID(), groupId, match, kickoff, competition, coupon, category: inferCategory(market), market, selection, odds: String(odds || ''), stake, payout, sourceName, sourcePreview }, sectionLoose);
@@ -507,7 +559,7 @@ type DraftTextField = 'match' | 'kickoff' | 'competition' | 'coupon' | 'market' 
 function draftFieldScore(field: DraftTextField, value: string) {
   const normalized = clean(value);
   if (!normalized) return -1000;
-  if (field === 'match') return invalidMatchCandidate(normalized) || competitionOnlyMatch(normalized) ? -500 : (headToHeadMatch(normalized) ? 100 : 25);
+  if (field === 'match') return invalidMatchCandidate(normalized) || competitionOnlyMatch(normalized) ? -500 : matchCandidateScore(normalized);
   if (field === 'market') return semanticMarketLine(normalized) ? 110 + Math.min(35, normalized.length / 3) : 20;
   if (field === 'selection') return invalidSelectionCandidate(normalized) ? -500 : (semanticSelectionLine(normalized) ? 105 + Math.min(30, normalized.length / 3) : (semanticMarketLine(normalized) ? -100 : 18));
   if (field === 'kickoff') return /(?:\d{1,2}[/.]\d{1,2}|\d{1,2}:\d{2})/.test(normalized) ? 90 : (normalized === 'Tidspunkt ikke oppgitt' ? -20 : 12);
@@ -570,7 +622,18 @@ export function parseCouponCandidates(texts: string[], sourceName?: string, sour
 
 interface CouponBox { x: number; y: number; width: number; height: number; }
 interface PixelImage { width: number; height: number; data: Uint8ClampedArray; }
-interface CouponRegion { blob: Blob; ocrBlob: Blob; binaryBlob: Blob; previewUrl: string; box: CouponBox; sourceName: string; isDark: boolean; }
+interface CouponRegion {
+  blob: Blob;
+  ocrBlob: Blob;
+  binaryBlob: Blob;
+  previewUrl: string;
+  box: CouponBox;
+  sourceName: string;
+  sourceId: string;
+  sourceOrder: number;
+  regionOrder: number;
+  isDark: boolean;
+}
 
 function runs(values: number[], predicate: (value: number) => boolean, minimum: number) {
   const result: Array<{ start: number; end: number }> = [];
@@ -645,6 +708,52 @@ export function detectCouponBoxes(image: PixelImage): CouponBox[] {
 
 async function canvasToBlob(canvas: HTMLCanvasElement, type = 'image/png', quality?: number) {
   return new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error('Kunne ikke opprette bilde.')), type, quality));
+}
+
+interface DecodedCouponImage {
+  source: CanvasImageSource;
+  width: number;
+  height: number;
+  close: () => void;
+}
+
+/**
+ * Canonical decoder used for original uploads and every derived crop. The
+ * intrinsic decoded pixels are the only geometry source; viewport size, CSS
+ * size and devicePixelRatio must never affect OCR input.
+ */
+export async function decodeCanonicalCouponImage(blob: Blob): Promise<DecodedCouponImage> {
+  if (typeof createImageBitmap === 'function') {
+    try {
+      const bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image' });
+      return { source: bitmap, width: bitmap.width, height: bitmap.height, close: () => bitmap.close() };
+    } catch {
+      // Some mobile WebViews expose createImageBitmap but reject its options.
+      const bitmap = await createImageBitmap(blob);
+      return { source: bitmap, width: bitmap.width, height: bitmap.height, close: () => bitmap.close() };
+    }
+  }
+
+  const url = URL.createObjectURL(blob);
+  const image = document.createElement('img');
+  image.decoding = 'async';
+  image.src = url;
+  try {
+    if (typeof image.decode === 'function') await image.decode();
+    else await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = () => reject(new Error('Kunne ikke dekode bildet.'));
+    });
+  } catch (error) {
+    URL.revokeObjectURL(url);
+    throw error;
+  }
+  return {
+    source: image,
+    width: image.naturalWidth,
+    height: image.naturalHeight,
+    close: () => URL.revokeObjectURL(url),
+  };
 }
 
 function otsuThreshold(histogram: Uint32Array, total: number) {
@@ -742,7 +851,14 @@ function trimCouponWhitespace(source: HTMLCanvasElement) {
   return trimmed;
 }
 
-async function prepareCouponCanvas(canvas: HTMLCanvasElement, box: CouponBox, sourceName: string): Promise<CouponRegion> {
+async function prepareCouponCanvas(
+  canvas: HTMLCanvasElement,
+  box: CouponBox,
+  sourceName: string,
+  sourceId: string,
+  sourceOrder: number,
+  regionOrder: number,
+): Promise<CouponRegion> {
   const preparedCanvas = trimCouponWhitespace(canvas);
   const targetWidth = 1400; const maximumWidth = 1900; const maximumHeight = 3400;
   const scale = Math.min(4, Math.max(1, targetWidth / Math.max(1, preparedCanvas.width)), maximumWidth / Math.max(1, preparedCanvas.width), maximumHeight / Math.max(1, preparedCanvas.height));
@@ -799,16 +915,19 @@ async function prepareCouponCanvas(canvas: HTMLCanvasElement, box: CouponBox, so
     previewUrl: normalized.toDataURL('image/jpeg', .9),
     box,
     sourceName,
+    sourceId,
+    sourceOrder,
+    regionOrder,
     isDark,
   };
 }
 
-async function segmentCouponImage(file: File): Promise<CouponRegion[]> {
-  const bitmap = await createImageBitmap(file);
+async function segmentCouponImage(source: ImportSource): Promise<CouponRegion[]> {
+  const bitmap = await decodeCanonicalCouponImage(source.file);
   const canvas = document.createElement('canvas'); canvas.width = bitmap.width; canvas.height = bitmap.height;
   const context = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
   if (!context) { bitmap.close(); throw new Error('Canvas er ikke tilgjengelig.'); }
-  context.fillStyle = '#fff'; context.fillRect(0, 0, canvas.width, canvas.height); context.drawImage(bitmap, 0, 0);
+  context.fillStyle = '#fff'; context.fillRect(0, 0, canvas.width, canvas.height); context.drawImage(bitmap.source, 0, 0);
   const boxes = detectCouponBoxes(context.getImageData(0, 0, canvas.width, canvas.height));
   const regions: CouponRegion[] = [];
   for (let index = 0; index < boxes.length; index += 1) {
@@ -816,8 +935,15 @@ async function segmentCouponImage(file: File): Promise<CouponRegion[]> {
     const crop = document.createElement('canvas'); crop.width = Math.max(1, Math.round(box.width)); crop.height = Math.max(1, Math.round(box.height));
     const cropContext = crop.getContext('2d', { alpha: false }); if (!cropContext) continue;
     cropContext.fillStyle = '#fff'; cropContext.fillRect(0, 0, crop.width, crop.height);
-    cropContext.drawImage(bitmap, box.x, box.y, box.width, box.height, 0, 0, crop.width, crop.height);
-    regions.push(await prepareCouponCanvas(crop, box, `${file.name} · utsnitt ${index + 1}`));
+    cropContext.drawImage(bitmap.source, box.x, box.y, box.width, box.height, 0, 0, crop.width, crop.height);
+    regions.push(await prepareCouponCanvas(
+      crop,
+      box,
+      `${source.file.name} · utsnitt ${index + 1}`,
+      source.sourceId,
+      source.sourceOrder,
+      index,
+    ));
   }
   bitmap.close();
   return regions;
@@ -913,7 +1039,7 @@ function stripCouponIcons(value: string) {
 
 function positionedNoiseRow(value: string) {
   const key = receiptLineKey(value);
-  return !key || /^(?:oddsen(?:\s+(?:singel|system|aktiv|levert))*|singel|system|aktiv|levert|hjem|spill|mine spill|profil|vis detaljer|skjul detaljer)$/.test(key) ||
+  return !key || /\boddsen\b/.test(key) || /^(?:singel|system|aktiv|levert|hjem|spill|mine spill|profil|vis detaljer|skjul detaljer)$/.test(key) ||
     /^(?:4g|5g|wifi|volte|nfc)(?:\s|$)/.test(key) || /^\d{1,2}:\d{2}(?:\s+\d+)?$/.test(key);
 }
 
@@ -956,20 +1082,70 @@ function couponNumberFromRows(rows: PositionedOcrRow[]) {
 
 interface CouponDateParts { day: number; month: number; year: number; hour: number; minute: number; }
 
-function parseCouponDateParts(value: string): CouponDateParts | null {
+function parseCouponDateParts(value: string, fallbackYear?: number): CouponDateParts | null {
   const normalized = clean(value).toLocaleLowerCase('nb-NO').replace(/,/g, ' ');
   const weekday = '(?:(?:man(?:dag)?|tir(?:sdag)?|ons(?:dag)?|tor(?:sdag)?|fre(?:dag)?|l[øo]r(?:dag)?|s[øo]n(?:dag)?)\\.?\\s+)?';
   const named = normalized.match(new RegExp(`${weekday}(?:dato\\s*)?(\\d{1,2})\\.?\\s+(januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember)(?:\\s+(\\d{2,4}))?\\s+(?:kl\\.?\\s*)?(\\d{1,2})\\s*[:.]\\s*([0-9]{2})`, 'i'));
   if (named) {
-    let year = Number(named[3] || new Date().getFullYear());
+    let year = Number(named[3] || fallbackYear || 0);
     if (year > 0 && year < 100) year += 2000;
     return { day: Number(named[1]), month: NORWEGIAN_MONTHS[named[2]], year, hour: Number(named[4]), minute: Number(named[5]) };
   }
   const numeric = normalized.match(new RegExp(`${weekday}(?:dato\\s*)?(\\d{1,2})\\s*[./-]\\s*(\\d{1,2})(?:\\s*[./-]\\s*(\\d{2,4}))?\\s+(?:kl\\.?\\s*)?(\\d{1,2})\\s*[:.]\\s*([0-9]{2})`, 'i'));
   if (!numeric) return null;
-  let year = Number(numeric[3] || new Date().getFullYear());
+  let year = Number(numeric[3] || fallbackYear || 0);
   if (year > 0 && year < 100) year += 2000;
   return { day: Number(numeric[1]), month: Number(numeric[2]), year, hour: Number(numeric[4]), minute: Number(numeric[5]) };
+}
+
+function parseCouponReferenceDateParts(value: string): CouponDateParts | null {
+  const complete = parseCouponDateParts(value);
+  if (complete?.year) return complete;
+  const normalized = clean(value).toLocaleLowerCase('nb-NO').replace(/,/g, ' ');
+  const named = normalized.match(/(?:dato|levert)?\s*:?[\s\S]*?\b(\d{1,2})\.?\s+(januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember)\s+(\d{4})\b/i);
+  if (named) return { day: Number(named[1]), month: NORWEGIAN_MONTHS[named[2]], year: Number(named[3]), hour: 0, minute: 0 };
+  const numeric = normalized.match(/(?:dato|levert)?\s*:?[\s\S]*?\b(\d{1,2})\s*[./-]\s*(\d{1,2})\s*[./-]\s*(\d{4})\b/i);
+  return numeric ? { day: Number(numeric[1]), month: Number(numeric[2]), year: Number(numeric[3]), hour: 0, minute: 0 } : null;
+}
+
+function adjacentTextWindows(lines: string[], maximumLines = 4) {
+  const normalized = lines.map(clean).filter(Boolean);
+  const windows: string[] = [];
+  for (let start = 0; start < normalized.length; start += 1) {
+    for (let length = 1; length <= maximumLines && start + length <= normalized.length; length += 1) {
+      windows.push(clean(normalized.slice(start, start + length).join(' ')));
+    }
+  }
+  return windows;
+}
+
+function purchaseReferenceFromTextLines(lines: string[]) {
+  const normalized = lines.map(clean).filter(Boolean);
+  const labeledIndex = normalized.findIndex((line) => /\b(?:Dato|Levert)\b/i.test(line));
+  const labeled = labeledIndex >= 0 ? adjacentTextWindows(normalized.slice(labeledIndex, labeledIndex + 5), 5) : [];
+  const candidates = [...labeled, ...adjacentTextWindows(normalized, 4)];
+  return candidates.find((candidate) => validCouponDateParts(parseCouponReferenceDateParts(candidate))) || '';
+}
+
+function normalizeRelativeDayOcr(value: string) {
+  const relativeClock = '(?=\\s*(?:[·|:;,-]\\s*)*(?:[01]?\\d|2[0-3])\\s*(?:[:.]\\s*)?[0-5]\\d\\b)';
+  return clean(value
+    .replace(/\bIdag\b/gi, 'I dag')
+    .replace(new RegExp(`(?:^|\\s)(?:[i|l1!]\\s*)?dag${relativeClock}`, 'gi'), ' I dag')
+    .replace(new RegExp(`(?:^|\\s)(?:[i|l1!]\\s*)?morgen${relativeClock}`, 'gi'), ' I morgen'));
+}
+
+function kickoffCandidateFromTextLines(lines: string[]) {
+  for (const candidate of adjacentTextWindows(lines, 3)) {
+    const relativeCandidate = normalizeRelativeDayOcr(candidate);
+    const relative = relativeCandidate.match(/\b(?:I\s*dag|Idag|I\s*morgen)[\s·|:;,-]*\d{1,2}\s*[:.]\s*\d{2}\b/i)?.[0];
+    if (relative) return clean(relative);
+    const compactRelative = relativeCandidate.match(/\b(?:I\s*dag|Idag|I\s*morgen)[\s·|:;,-]*(?:[01]\d|2[0-3])[0-5]\d\b/i)?.[0];
+    if (compactRelative) return clean(compactRelative);
+    const absolute = candidate.match(/\b(?:(?:man|tir|ons|tor|fre|l[øo]r|s[øo]n)\.?\s*)?\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\s+\d{1,2}\s*[:.]\s*\d{2}\b/i)?.[0];
+    if (absolute) return clean(absolute);
+  }
+  return '';
 }
 
 function formatCouponDate(parts: CouponDateParts) {
@@ -988,13 +1164,15 @@ function validCouponDateParts(parts: CouponDateParts | null): parts is CouponDat
   return date.getUTCFullYear() === parts.year && date.getUTCMonth() + 1 === parts.month && date.getUTCDate() === parts.day;
 }
 
-function normalizeAbsoluteKickoff(value: string) {
-  const normalized = clean(value).replace(/\bIdag\b/gi, 'I dag');
-  const parts = parseCouponDateParts(normalized);
+function normalizeAbsoluteKickoff(value: string, fallbackYear?: number) {
+  const normalized = normalizeRelativeDayOcr(value);
+  const parts = parseCouponDateParts(normalized, fallbackYear);
   return validCouponDateParts(parts) ? formatCouponDate(parts) : '';
 }
 
 function purchaseDateFromRows(rows: PositionedOcrRow[]) {
+  const sharedCandidate = purchaseReferenceFromTextLines(rows.map((row) => row.text));
+  if (sharedCandidate) return sharedCandidate;
   const candidates: string[] = [];
   rows.forEach((row, index) => {
     if (!/\bDato\b/i.test(row.text)) return;
@@ -1010,10 +1188,10 @@ function purchaseDateFromRows(rows: PositionedOcrRow[]) {
 
   // Fallback for OCR that misses the literal «Dato», but still reads the date.
   rows.slice(Math.floor(rows.length * .55)).forEach((row) => {
-    if (/(?:januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember|\d{1,2}[./-]\d{1,2}).*\d{1,2}[:.]\d{2}/i.test(row.text)) candidates.push(row.text);
+    if (/(?:januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember|\d{1,2}[./-]\d{1,2})/i.test(row.text)) candidates.push(row.text);
   });
 
-  return candidates.find((candidate) => validCouponDateParts(parseCouponDateParts(candidate))) || candidates[0] || '';
+  return candidates.find((candidate) => validCouponDateParts(parseCouponReferenceDateParts(candidate))) || candidates[0] || '';
 }
 
 function extractClock(value: string) {
@@ -1024,12 +1202,12 @@ function extractClock(value: string) {
 }
 
 function resolvePositionedKickoff(rawValue: string, purchaseValue: string) {
-  const raw = clean(rawValue).replace(/\bIdag\b/i, 'I dag');
-  const absolute = normalizeAbsoluteKickoff(raw);
+  const raw = normalizeRelativeDayOcr(rawValue);
+  const purchase = parseCouponReferenceDateParts(purchaseValue);
+  const absolute = normalizeAbsoluteKickoff(raw, validCouponDateParts(purchase) ? purchase.year : undefined);
   if (absolute) return absolute;
 
   const time = extractClock(raw);
-  const purchase = parseCouponDateParts(purchaseValue);
   if (!time || !validCouponDateParts(purchase)) return '';
 
   const numericDate = /\b(?:I\s*dag|Idag|I\s*morgen)\b/i.test(raw)
@@ -1049,12 +1227,15 @@ function resolvePositionedKickoff(rawValue: string, purchaseValue: string) {
 
 function kickoffCandidateFromRows(rows: PositionedOcrRow[]) {
   const texts = rows.map((row) => clean(row.text));
+  const sharedCandidate = kickoffCandidateFromTextLines(texts);
+  if (sharedCandidate) return sharedCandidate;
   for (let index = 0; index < texts.length; index += 1) {
     const candidates = [texts[index], clean(`${texts[index]} ${texts[index + 1] || ''}`), clean(`${texts[index - 1] || ''} ${texts[index]}`)];
     for (const candidate of candidates) {
-      const relative = candidate.match(/\b(?:I\s*dag|Idag|I\s*morgen)\s*\d{1,2}\s*[:.]\s*\d{2}\b/i)?.[0];
+      const relativeCandidate = normalizeRelativeDayOcr(candidate);
+      const relative = relativeCandidate.match(/\b(?:I\s*dag|Idag|I\s*morgen)[\s·|:;,-]*\d{1,2}\s*[:.]\s*\d{2}\b/i)?.[0];
       if (relative) return relative;
-      const compactRelative = candidate.match(/\b(?:I\s*dag|Idag|I\s*morgen)\s*(?:[01]\d|2[0-3])[0-5]\d\b/i)?.[0];
+      const compactRelative = relativeCandidate.match(/\b(?:I\s*dag|Idag|I\s*morgen)[\s·|:;,-]*(?:[01]\d|2[0-3])[0-5]\d\b/i)?.[0];
       if (compactRelative) return compactRelative;
       const absolute = candidate.match(/\b(?:(?:man|tir|ons|tor|fre|l[øo]r|s[øo]n)\.?\s*)?\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\s+\d{1,2}\s*[:.]\s*\d{2}\b/i)?.[0];
       if (absolute) return absolute;
@@ -1064,8 +1245,8 @@ function kickoffCandidateFromRows(rows: PositionedOcrRow[]) {
 }
 
 function removeKickoffCandidate(value: string) {
-  return clean(value
-    .replace(/\b(?:I\s*dag|Idag|I\s*morgen)\s*\d{1,2}[:.]\d{2}\b/gi, ' ')
+  return clean(normalizeRelativeDayOcr(value)
+    .replace(/\b(?:I\s*dag|Idag|I\s*morgen)[\s·|:;,-]*\d{1,2}\s*[:.]\s*\d{2}\b/gi, ' ')
     .replace(/\b(?:(?:man|tir|ons|tor|fre|l[øo]r|s[øo]n)\.?\s*)?\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\s+\d{1,2}[:.]\d{2}\b/gi, ' '));
 }
 
@@ -1146,9 +1327,10 @@ function positionedOutcomeSelection(rows: PositionedOcrRow[], summaryOdds: numbe
 
 function likelyTeamLine(value: string) {
   const text = removeKickoffCandidate(value);
-  if (!text || text.length > 60 || /[?]/.test(text) || /\d/.test(text) || semanticMarketLine(text)) return false;
+  if (!text || text.length > 60 || /[?]/.test(text) || /\d/.test(text) || semanticMarketLine(text) || receiptNoiseLine(text)) return false;
+  if (/^I\s*(?:dag|morgen)$/i.test(text) || NORWEGIAN_MONTH_PATTERN.test(text)) return false;
   if (/(?:fotball.?vm|world cup|spesialer|internasjonal)/i.test(text)) return false;
-  return text.split(/\s+/).length <= 6 && /[A-Za-zÆØÅæøå]/.test(text);
+  return Boolean(safeMatchParticipant(text)) && text.split(/\s+/).length <= 6;
 }
 
 function normalizeVersusMatch(value: string) {
@@ -1158,7 +1340,10 @@ function normalizeVersusMatch(value: string) {
 
 function validPositionedMatch(value: string, market = '', competition = '') {
   const text = clean(value);
-  return Boolean(eventMatchFallback(text, market, competition)) && !semanticMarketLine(text) && !/\b(?:I\s*dag|I\s*morgen)\b|\d{1,2}:\d{2}/i.test(text);
+  const accepted = eventMatchFallback(text, market, competition);
+  const category = inferCategory(market);
+  return Boolean(accepted) && (category === 'Spesial' || Boolean(safeHeadToHead(accepted, competition))) &&
+    !semanticMarketLine(text) && !/\b(?:I\s*dag|I\s*morgen)\b|\d{1,2}:\d{2}/i.test(text);
 }
 
 export function parsePositionedCoupon(blocks: unknown, sourceName?: string, sourcePreview?: string): ImportDraft | null {
@@ -1248,7 +1433,7 @@ export function parsePositionedCoupon(blocks: unknown, sourceName?: string, sour
   if (explicitVersus) match = normalizeVersusMatch(explicitVersus);
   else if (!special) {
     const teams = matchRows.filter(likelyTeamLine);
-    if (teams.length >= 2) match = `${teams[0]} vs ${teams[1]}`;
+    if (teams.length >= 2) match = `${teams.at(-2)} vs ${teams.at(-1)}`;
   }
   if (!match) match = clean(matchRows.join(' '));
   if (!validPositionedMatch(match, market, competition)) match = '';
@@ -1281,6 +1466,7 @@ export function mergePositionedWithText(positioned: ImportDraft | null, textCand
   if (!fallback) return [primary];
 
   const fallbackMatch = validPositionedMatch(fallback.match, fallback.market, fallback.competition) ? fallback.match : '';
+  const primaryMatch = validPositionedMatch(primary.match, primary.market, primary.competition) ? primary.match : '';
   const primaryKickoff = normalizeAbsoluteKickoff(primary.kickoff);
   const fallbackKickoff = normalizeAbsoluteKickoff(fallback.kickoff);
   const couponValid = (value: string) => /^\d{6,12}(?:\.\d+)?$/.test(clean(value));
@@ -1301,7 +1487,7 @@ export function mergePositionedWithText(positioned: ImportDraft | null, textCand
 
   const merged: ImportDraft = {
     ...primary,
-    match: validPositionedMatch(primary.match, primary.market, primary.competition) ? primary.match : fallbackMatch,
+    match: bestMatchCandidate([primaryMatch, fallbackMatch], clean(primary.competition) || clean(fallback.competition)),
     kickoff: primaryKickoff || fallbackKickoff,
     competition: clean(primary.competition) || (!/^Fotball-VM 2026$/i.test(clean(fallback.competition)) ? clean(fallback.competition) : ''),
     coupon: couponValid(primary.coupon) ? primary.coupon : (couponValid(fallback.coupon) ? fallback.coupon : ''),
@@ -1335,13 +1521,20 @@ function dedupeAnchors(anchors: OcrBox[], width: number, height: number) {
 }
 
 async function cropRegion(region: CouponRegion, box: CouponBox, suffix: string): Promise<CouponRegion> {
-  const bitmap = await createImageBitmap(region.blob);
+  const bitmap = await decodeCanonicalCouponImage(region.blob);
   const crop = document.createElement('canvas'); crop.width = Math.max(1, Math.round(box.width)); crop.height = Math.max(1, Math.round(box.height));
   const context = crop.getContext('2d', { alpha: false });
   if (!context) { bitmap.close(); throw new Error('Canvas er ikke tilgjengelig.'); }
   context.fillStyle = '#fff'; context.fillRect(0, 0, crop.width, crop.height);
-  context.drawImage(bitmap, box.x, box.y, box.width, box.height, 0, 0, crop.width, crop.height); bitmap.close();
-  return prepareCouponCanvas(crop, box, `${region.sourceName} · ${suffix}`);
+  context.drawImage(bitmap.source, box.x, box.y, box.width, box.height, 0, 0, crop.width, crop.height); bitmap.close();
+  return prepareCouponCanvas(
+    crop,
+    box,
+    `${region.sourceName} · ${suffix}`,
+    region.sourceId,
+    region.sourceOrder,
+    region.regionOrder,
+  );
 }
 
 export function detectOcrGridBoxes(width: number, height: number, blocks: unknown): CouponBox[] {
@@ -1392,7 +1585,7 @@ export function detectOcrGridBoxes(width: number, height: number, blocks: unknow
 }
 
 async function splitRegionByOcrAnchors(region: CouponRegion, blocks: unknown): Promise<CouponRegion[]> {
-  const bitmap = await createImageBitmap(region.blob); const width = bitmap.width; const height = bitmap.height; bitmap.close();
+  const bitmap = await decodeCanonicalCouponImage(region.blob); const width = bitmap.width; const height = bitmap.height; bitmap.close();
   const boxes = detectOcrGridBoxes(width, height, blocks);
   if (boxes.length < 2) return [region];
   const cells: CouponRegion[] = [];
@@ -1441,7 +1634,7 @@ function dedupeOcrLines(parts: string[]) {
 }
 
 async function recognizeTiledText(worker: Awaited<ReturnType<typeof createWorker>>, region: CouponRegion) {
-  const bitmap = await createImageBitmap(region.isDark ? region.binaryBlob : region.ocrBlob);
+  const bitmap = await decodeCanonicalCouponImage(region.isDark ? region.binaryBlob : region.ocrBlob);
   if (bitmap.height / Math.max(1, bitmap.width) < 1.45) { bitmap.close(); return ''; }
   const tileHeight = Math.min(bitmap.height, Math.max(720, Math.round(bitmap.width * 1.35)));
   const tileStep = Math.max(1, Math.round(tileHeight * .88));
@@ -1452,7 +1645,7 @@ async function recognizeTiledText(worker: Awaited<ReturnType<typeof createWorker
     const tile = document.createElement('canvas'); tile.width = bitmap.width; tile.height = height;
     const context = tile.getContext('2d', { alpha: false }); if (!context) continue;
     context.fillStyle = '#fff'; context.fillRect(0, 0, tile.width, tile.height);
-    context.drawImage(bitmap, 0, top, bitmap.width, height, 0, 0, tile.width, height);
+    context.drawImage(bitmap.source, 0, top, bitmap.width, height, 0, 0, tile.width, height);
     texts.push((await worker.recognize(await canvasToBlob(tile))).data.text);
     if (top + height >= bitmap.height) break;
   }
@@ -1507,29 +1700,18 @@ async function recognizeRegionTexts(worker: Awaited<ReturnType<typeof createWork
 
 function normalizeImportedDraft(item: ImportDraft) {
   const normalizedKickoff = normalizeAbsoluteKickoff(item.kickoff);
-  return reconcileDraftEconomics({
+  return {
     ...item,
     kickoff: normalizedKickoff || clean(item.kickoff),
     coupon: clean(item.coupon).replace(/\s/g, '').replace(/(?<=\d),(?=\d)/g, '.'),
-  });
+    odds: clean(item.odds),
+    stake: clean(item.stake),
+    payout: clean(item.payout),
+  };
 }
 
 function reconcileImportedDrafts(items: ImportDraft[]) {
-  const normalizedItems = items.map(normalizeImportedDraft);
-  const knownByTime = new Map<string, Set<string>>();
-  normalizedItems.forEach((item) => {
-    const match = clean(item.match);
-    const key = `${clean(item.kickoff).toLowerCase()}|${clean(item.competition).toLowerCase()}`;
-    if (clean(item.kickoff) && match) {
-      const matches = knownByTime.get(key) || new Set<string>(); matches.add(match); knownByTime.set(key, matches);
-    }
-  });
-  return normalizedItems.map((item) => {
-    if (clean(item.match)) return item;
-    const key = `${clean(item.kickoff).toLowerCase()}|${clean(item.competition).toLowerCase()}`;
-    const matches = [...(knownByTime.get(key) || [])];
-    return matches.length === 1 ? { ...item, match: matches[0] } : item;
-  });
+  return items.map(normalizeImportedDraft);
 }
 
 export function draftErrors(item: ImportDraft) {
@@ -1555,13 +1737,133 @@ export function draftErrors(item: ImportDraft) {
   if (!competition || normalizedItem.competition.length > 100 || /Spillobjekt|Spilt\s+utfall|\bI\s*(?:dag|morgen)\b/i.test(competition)) errors.push('Turneringsnavnet må kontrolleres.');
   if (!/^\d{6,12}(?:\.\d+)?$/.test(coupon)) errors.push('Kupongnummer mangler eller har ugyldig format.');
 
-  const odds = oddsFrom(normalizedItem.odds); const stake = numberFrom(normalizedItem.stake); const payout = numberFrom(normalizedItem.payout);
+  const odds = numberFrom(normalizedItem.odds); const stake = numberFrom(normalizedItem.stake); const payout = numberFrom(normalizedItem.payout);
   if (!(odds > 1 && odds < 1000)) errors.push('Odds må være et tall mellom 1 og 1000.');
   if (!(stake > 0 && stake < 1_000_000)) errors.push('Innsats mangler eller er ugyldig.');
   if (!(payout > 0)) errors.push('Mulig premie mangler eller er ugyldig.');
   if (odds > 1 && market && new RegExp(`(?:^|\\s)${odds.toFixed(2).replace('.', '[.,]')}\\s*$`).test(market)) errors.push('Markedet ser ut til å inneholde spillvalgets odds.');
   if (odds > 1 && stake > 0 && payout > 0 && Math.abs((odds * stake) - payout) > Math.max(2, payout * .06)) errors.push('Innsats × odds stemmer ikke med mulig premie.');
   return [...new Set(errors)];
+}
+
+export interface CanonicalImportPipelineOptions {
+  onProgress?: (progress: number) => void;
+  onDetectedRegions?: (count: number) => void;
+  workerFactory?: typeof createWorker;
+}
+
+export interface CanonicalImportPipelineResult {
+  drafts: ImportDraft[];
+  detectedRegions: number;
+}
+
+export async function processImportSourcesInOrder<T>(
+  sources: readonly ImportSource[],
+  processSource: (source: ImportSource) => Promise<T>,
+) {
+  const completed = await Promise.all(sources.map(async (source) => ({
+    source,
+    result: await processSource(source),
+  })));
+  return completed.sort((a, b) => a.source.sourceOrder - b.source.sourceOrder);
+}
+
+/**
+ * The only image-import pipeline. File picker, drag-and-drop and a mobile
+ * camera/file chooser all pass the original File objects into this function.
+ */
+export async function importCouponFiles(
+  sources: readonly ImportSource[],
+  options: CanonicalImportPipelineOptions = {},
+): Promise<CanonicalImportPipelineResult> {
+  const orderedSources = [...sources].sort((a, b) => a.sourceOrder - b.sourceOrder);
+  const batches = await processImportSourcesInOrder(orderedSources, segmentCouponImage);
+  const initialRegions = batches.flatMap(({ result }) => result)
+    .sort((a, b) => (a.sourceOrder - b.sourceOrder) || (a.regionOrder - b.regionOrder));
+  if (!initialRegions.length) throw new Error('Ingen kupongområder ble funnet.');
+
+  let activeRegionIndex = 0;
+  let progressTotal = initialRegions.length;
+  const workerFactory = options.workerFactory || createWorker;
+  const worker = await workerFactory('nor+eng', 1, {
+    logger: (message) => {
+      if (message.status === 'recognizing text') {
+        options.onProgress?.((activeRegionIndex + message.progress) / Math.max(1, progressTotal));
+      }
+    },
+  });
+
+  try {
+    const finalRegions: CouponRegion[] = [];
+    const cachedRecognition = new Map<Blob, Awaited<ReturnType<typeof recognizeBestRegion>>>();
+    for (let index = 0; index < initialRegions.length; index += 1) {
+      activeRegionIndex = index;
+      const region = initialRegions[index];
+      const preliminary = await recognizeBestRegion(worker, region, true);
+      const split = await splitRegionByOcrAnchors(region, preliminary.data.blocks);
+      if (split.length > 1) {
+        split.forEach((cell, splitIndex) => finalRegions.push({
+          ...cell,
+          regionOrder: (region.regionOrder * 100) + splitIndex,
+        }));
+      } else {
+        finalRegions.push(region);
+        cachedRecognition.set(region.blob, preliminary);
+      }
+    }
+
+    finalRegions.sort((a, b) => (a.sourceOrder - b.sourceOrder) || (a.regionOrder - b.regionOrder));
+    options.onDetectedRegions?.(finalRegions.length);
+    progressTotal = finalRegions.length;
+    const found: ImportDraft[] = [];
+
+    for (let index = 0; index < finalRegions.length; index += 1) {
+      activeRegionIndex = index;
+      const region = finalRegions[index];
+      const recognition = cachedRecognition.get(region.blob) || await recognizeBestRegion(worker, region, true);
+      const positioned = parsePositionedCoupon(recognition.data.blocks, region.sourceName, region.previewUrl);
+      const texts = await recognizeRegionTexts(worker, region, recognition.data.text);
+      const textCandidates = parseCouponCandidates(texts, region.sourceName, region.previewUrl);
+      const parsed = mergePositionedWithText(positioned, textCandidates);
+      const regionDrafts = parsed.length ? parsed : [{ ...draft(), sourceName: region.sourceName, sourcePreview: region.previewUrl }];
+      found.push(...regionDrafts.map((item) => ({
+        ...item,
+        sourceId: region.sourceId,
+        sourceOrder: region.sourceOrder,
+        regionOrder: region.regionOrder,
+      })));
+      options.onProgress?.((index + 1) / finalRegions.length);
+    }
+
+    const drafts = reconcileImportedDrafts(found)
+      .sort((a, b) => ((a.sourceOrder ?? 0) - (b.sourceOrder ?? 0)) || ((a.regionOrder ?? 0) - (b.regionOrder ?? 0)));
+    return { drafts, detectedRegions: finalRegions.length };
+  } finally {
+    await worker.terminate();
+  }
+}
+
+export interface ValidatedImportBatch {
+  normalized: ImportDraft[];
+  invalid: ImportDraft[];
+  ready: ImportDraft[];
+}
+
+/** Revalidates at the persistence boundary; UI state is never trusted. */
+export function validateImportForPersistence(items: readonly ImportDraft[]): ValidatedImportBatch {
+  const normalized = reconcileImportedDrafts([...items]);
+  const invalid = normalized.filter((item) => draftErrors(item).length > 0);
+  if (invalid.length) return { normalized, invalid, ready: [] };
+
+  const seenSelections = new Set<string>();
+  const ready = normalized.filter((item) => {
+    if (!item.coupon) return true;
+    const identity = [clean(item.coupon), clean(item.match), clean(item.market), clean(item.selection)].join('|').toLowerCase();
+    if (seenSelections.has(identity)) return false;
+    seenSelections.add(identity);
+    return true;
+  });
+  return { normalized, invalid: [], ready };
 }
 
 function readStoredBets(): TrackedBet[] {
@@ -1709,7 +2011,8 @@ export function OddsenTracker() {
   const [importMode, setImportMode] = useState<ImportMode>('image');
   const [importStep, setImportStep] = useState<ImportStep>('source');
   const [importText, setImportText] = useState('');
-  const [uploadFiles, setUploadFiles] = useState<UploadFile[]>([]);
+  const [uploadFiles, setUploadFiles] = useState<ImportSource[]>([]);
+  const nextSourceOrder = useRef(0);
   const [drafts, setDrafts] = useState<ImportDraft[]>([]);
   const [ocrBusy, setOcrBusy] = useState(false);
   const [ocrProgress, setOcrProgress] = useState(0);
@@ -1824,6 +2127,7 @@ export function OddsenTracker() {
   function resetImportSource() {
     uploadFiles.forEach((item) => URL.revokeObjectURL(item.url));
     setUploadFiles([]);
+    nextSourceOrder.current = 0;
     setImportText('');
     setImportError('');
     setOcrProgress(0);
@@ -1870,9 +2174,15 @@ export function OddsenTracker() {
   }
 
   function addFiles(files: FileList | File[]) {
-    const images = [...files].filter((file) => file.type.startsWith('image/')).slice(0, Math.max(0, 8 - uploadFiles.length));
-    if (!images.length) return setImportError('Velg PNG-, JPG- eller WEBP-bilder.');
-    setUploadFiles((all) => [...all, ...images.map((file) => ({ file, url: URL.createObjectURL(file) }))]); setImportError('');
+    const candidates = [...files].filter((file) => file.type.startsWith('image/') || /\.(?:png|jpe?g|webp)$/i.test(file.name));
+    if (!candidates.length) return setImportError('Velg PNG-, JPG- eller WEBP-bilder.');
+    setUploadFiles((all) => {
+      const images = candidates.slice(0, Math.max(0, 8 - all.length));
+      const prepared = createCanonicalImportSources(images, nextSourceOrder.current);
+      nextSourceOrder.current += prepared.length;
+      return [...all, ...prepared];
+    });
+    setImportError('');
   }
 
   async function processSource() {
@@ -1883,43 +2193,15 @@ export function OddsenTracker() {
     }
     if (!uploadFiles.length || ocrBusy) return setImportError('Legg til minst ett skjermbilde først.');
     setOcrBusy(true); setImportError(''); setOcrProgress(0);
-    let worker: Awaited<ReturnType<typeof createWorker>> | undefined;
     try {
-      const initialRegions: CouponRegion[] = [];
-      for (const item of uploadFiles) initialRegions.push(...await segmentCouponImage(item.file));
-      if (!initialRegions.length) throw new Error('Ingen kupongområder ble funnet.');
-      let activeRegionIndex = 0;
-      let progressTotal = initialRegions.length;
-      worker = await createWorker('nor+eng', 1, { logger: (message) => { if (message.status === 'recognizing text') setOcrProgress((activeRegionIndex + message.progress) / Math.max(1, progressTotal)); } });
-      const finalRegions: CouponRegion[] = [];
-      const cachedRecognition = new Map<Blob, Awaited<ReturnType<typeof recognizeBestRegion>>>();
-      for (let index = 0; index < initialRegions.length; index += 1) {
-        activeRegionIndex = index;
-        const region = initialRegions[index];
-        const preliminary = await recognizeBestRegion(worker, region, true);
-        const split = await splitRegionByOcrAnchors(region, preliminary.data.blocks);
-        if (split.length > 1) finalRegions.push(...split);
-        else { finalRegions.push(region); cachedRecognition.set(region.blob, preliminary); }
-      }
-      setDetectedRegions(finalRegions.length);
-      progressTotal = finalRegions.length;
-      const found: ImportDraft[] = [];
-      for (let index = 0; index < finalRegions.length; index += 1) {
-        activeRegionIndex = index;
-        const region = finalRegions[index];
-        const recognition = cachedRecognition.get(region.blob) || await recognizeBestRegion(worker, region, true);
-        const positioned = parsePositionedCoupon(recognition.data.blocks, region.sourceName, region.previewUrl);
-        const texts = await recognizeRegionTexts(worker, region, recognition.data.text);
-        const textCandidates = parseCouponCandidates(texts, region.sourceName, region.previewUrl);
-        const parsed = mergePositionedWithText(positioned, textCandidates);
-        if (parsed.length) found.push(...parsed);
-        else found.push({ ...draft(), sourceName: region.sourceName, sourcePreview: region.previewUrl });
-        setOcrProgress((index + 1) / finalRegions.length);
-      }
-      acceptImportedDrafts(reconcileImportedDrafts(found));
+      const result = await importCouponFiles(uploadFiles, {
+        onProgress: setOcrProgress,
+        onDetectedRegions: setDetectedRegions,
+      });
+      acceptImportedDrafts(result.drafts);
     } catch (error) {
       console.error(error); setImportError('Bildelesingen kunne ikke fullføres. Sjekk nettilgangen til OCR-språkdataene, eller bruk tekstimport.');
-    } finally { if (worker) await worker.terminate(); setOcrBusy(false); }
+    } finally { setOcrBusy(false); }
   }
 
   function updateDraft(id: string, field: keyof ImportDraft, value: string) {
@@ -1927,18 +2209,9 @@ export function OddsenTracker() {
   }
 
   function commitImport() {
-    const normalizedDrafts = reconcileImportedDrafts(drafts);
+    const { normalized: normalizedDrafts, invalid, ready: valid } = validateImportForPersistence(drafts);
     setDrafts(normalizedDrafts);
-    const invalid = normalizedDrafts.filter((item) => draftErrors(item).length > 0);
     if (invalid.length) return setImportError(`${invalid.length} ${invalid.length === 1 ? 'kupong har' : 'kuponger har'} feil som må rettes før lagring.`);
-    const seenSelections = new Set<string>();
-    const valid = normalizedDrafts.filter((item) => {
-      if (!item.coupon) return true;
-      const identity = [clean(item.coupon), clean(item.match), clean(item.market), clean(item.selection)].join('|').toLowerCase();
-      if (seenSelections.has(identity)) return false;
-      seenSelections.add(identity);
-      return true;
-    });
     if (!valid.length) return setImportError('Ingen kuponger er klare for lagring.');
     const knownCoupons = new Set(bets.map((bet) => bet.coupon).filter(Boolean));
     const fresh = valid.filter((item) => !item.coupon || !knownCoupons.has(item.coupon));
@@ -1967,12 +2240,14 @@ export function OddsenTracker() {
           <dl className="hero-stats"><div><dt>VM-kuponger</dt><dd>{totals.coupons}</dd></div><div><dt>VM-innsats</dt><dd>{money.format(totals.stake)} kr</dd></div><div><dt>Høyeste odds</dt><dd>{totals.highest ? totals.highest.toFixed(2) : '—'}</dd></div></dl>
         </section>
 
-        <section className="overview-card" aria-labelledby="overview-title">
-          <div className="overview-copy"><span className="section-kicker">Oversikt</span><h2 id="overview-title">Mine <em>spill</em></h2><p>{bets.length ? 'Følg innsats, odds og mulig premie per kamp. Marker spill for å bygge en kampkupong.' : 'Arbeidsområdet er tomt. Start med skjermbilder, kupongtekst eller manuell registrering i importfeltet under.'}</p></div>
-          <dl className="overview-stats"><div><dt>Kuponger</dt><dd>{totals.coupons}</dd></div><div><dt>Total innsats</dt><dd>{money.format(totals.stake)} kr</dd></div><div><dt>Høyeste mulige premie</dt><dd>{money.format(bets.reduce((max, bet) => Math.max(max, bet.payout), 0))} kr</dd></div><div><dt>Gjennomsnittlig odds</dt><dd>{totals.averageOdds ? totals.averageOdds.toFixed(2) : '—'}</dd></div></dl>
-        </section>
+        {bets.length === 0 && <section className="empty-dashboard" aria-labelledby="empty-dashboard-title"><button className="empty-visual" type="button" onClick={() => openImport('image')} aria-label="Åpne import av kupong" title="Importer kupong"><Upload size={28} /></button><span className="section-kicker">Arbeidsområdet er klart</span><h2 id="empty-dashboard-title">Importer din første kupong</h2><p>Start med skjermbilder. Kupongtekst og manuell registrering finnes i samme dialog.</p><div className="empty-methods" aria-label="Tilgjengelige importmetoder"><span><ImageIcon size={13} /> Skjermbilder</span><span><FileText size={13} /> Kupongtekst</span><span><Plus size={13} /> Manuelt</span></div></section>}
 
-        {bets.length > 0 ? <>
+        {bets.length > 0 && <section className="overview-card" aria-labelledby="overview-title">
+          <div className="overview-copy"><span className="section-kicker">Oversikt</span><h2 id="overview-title">Mine <em>spill</em></h2><p>Følg innsats, odds og mulig premie per kamp. Marker spill for å bygge en kampkupong.</p></div>
+          <dl className="overview-stats"><div><dt>Kuponger</dt><dd>{totals.coupons}</dd></div><div><dt>Total innsats</dt><dd>{money.format(totals.stake)} kr</dd></div><div><dt>Høyeste mulige premie</dt><dd>{money.format(bets.reduce((max, bet) => Math.max(max, bet.payout), 0))} kr</dd></div><div><dt>Gjennomsnittlig odds</dt><dd>{totals.averageOdds ? totals.averageOdds.toFixed(2) : '—'}</dd></div></dl>
+        </section>}
+
+        {bets.length > 0 && <>
           {matchGroups.map((group) => {
             const filter = filters[group.match] || 'Alle';
             const visible = filter === 'Alle' ? group.bets : group.bets.filter((bet) => bet.category === filter);
@@ -2147,7 +2422,7 @@ export function OddsenTracker() {
             );
           })}
           <section className="workspace-danger-zone" aria-label="Administrer spill og kuponger"><div><strong>Slett alle kuponger</strong><span>Fjerner {matchGroups.length} {matchGroups.length === 1 ? 'kamp' : 'kamper'}, {bets.length} spillvalg og {totals.coupons} kuponger fra denne nettleseren.</span></div><button className="delete-all-button" type="button" onClick={() => { if (window.confirm(`Slett alle spill og kuponger?\n\nDette fjerner ${matchGroups.length} kampkort, ${bets.length} spillvalg og ${totals.coupons} kuponger.\n\nHandlingen kan ikke angres.`)) removeAllGamesAndCoupons(); }}><Trash2 size={17} /> Slett alle spill og kuponger</button></section>
-        </> : <section className="empty-dashboard" aria-labelledby="empty-dashboard-title"><button className="empty-visual" type="button" onClick={() => openImport('image')} aria-label="Åpne import av kupong" title="Importer kupong"><Upload size={28} /></button><span className="section-kicker">Arbeidsområdet er klart</span><h2 id="empty-dashboard-title">Importer din første kupong</h2><p>Klikk på ikonet for å starte med skjermbilder. Kupongtekst og manuell registrering velges i samme importdialog.</p><div className="empty-methods" aria-label="Tilgjengelige importmetoder"><span><ImageIcon size={13} /> Skjermbilder</span><span><FileText size={13} /> Kupongtekst</span><span><Plus size={13} /> Manuelt</span></div></section>}
+        </>}
       </main>
 
       {importOpen && <div className="modal-backdrop" role="presentation">
@@ -2155,7 +2430,7 @@ export function OddsenTracker() {
           <header className="import-header"><div><span className="section-kicker">{importStep === 'review' ? 'Kontroller før lagring' : importStep === 'success' ? 'Import fullført' : appendImport ? 'Utvid innlesningen' : 'Ny kupongimport'}</span><h2 id="import-title">{importStep === 'review' ? `${draftCouponCount} ${draftCouponCount === 1 ? 'kupong' : 'kuponger'} · ${drafts.length} spillvalg` : importStep === 'success' ? 'Kupongene er lagt til' : appendImport ? 'Importer flere kuponger' : 'Importer kupong'}</h2></div><button type="button" onClick={closeImport} aria-label="Lukk"><X /></button></header>
           {importStep === 'source' && <div className="import-body">
             <div className="import-tabs" role="tablist" aria-label="Velg importmetode"><button type="button" role="tab" aria-selected={importMode === 'image'} className={importMode === 'image' ? 'active' : ''} onClick={() => { setImportMode('image'); setImportError(''); }}><ImageIcon size={16} /> Skjermbilder</button><button type="button" role="tab" aria-selected={importMode === 'text'} className={importMode === 'text' ? 'active' : ''} onClick={() => { setImportMode('text'); setImportError(''); }}><FileText size={16} /> Kupongtekst</button></div>
-            {importMode === 'image' ? <><input id="coupon-images" className="sr-only" type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={(event: ChangeEvent<HTMLInputElement>) => { if (event.target.files) addFiles(event.target.files); event.currentTarget.value = ''; }} /><label className="dropzone" htmlFor="coupon-images" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles(event.dataTransfer.files); }}><Upload size={30} /><strong>Slipp skjermbilder her</strong><span>eller klikk for å velge PNG, JPG eller WEBP · maks 8 bilder</span></label>{uploadFiles.length > 0 && <div className="image-queue">{uploadFiles.map((item) => <figure key={item.url}><img src={item.url} alt={item.file.name} /><figcaption>{item.file.name}</figcaption><button type="button" onClick={() => { URL.revokeObjectURL(item.url); setUploadFiles((all) => all.filter((file) => file.url !== item.url)); }} aria-label={`Fjern ${item.file.name}`}><X size={14} /></button></figure>)}</div>}{ocrBusy && <div className="ocr-progress"><div><Loader2 className="spin" size={17} /><span>{detectedRegions ? `${detectedRegions} kupongområder funnet` : 'Deler bildet i kuponger'} · {Math.round(ocrProgress * 100)} %</span></div><i style={{ width: `${Math.round(ocrProgress * 100)}%` }} /></div>}</> : <label className="text-source">Kupongtekst<textarea value={importText} onChange={(event) => setImportText(event.target.value)} placeholder={'Lim inn én eller flere kvitteringer her…\n\nInnsats: 100,00\nOdds: 2.10\nMulig Premie: 210,00\n1. Norge v England\nStarttid: 11/7 23:00\nSpillobjekt: Scorer mål\nSpilt utfall: Erling Haaland'} /></label>}
+            {importMode === 'image' ? <><input id="coupon-images" className="sr-only" type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={(event: ChangeEvent<HTMLInputElement>) => { if (event.target.files) addFiles(event.target.files); event.currentTarget.value = ''; }} /><label className="dropzone" htmlFor="coupon-images" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles(event.dataTransfer.files); }}><Upload size={30} /><strong>Velg skjermbilder</strong><span>Trykk for å velge eller ta bilde · PNG, JPG eller WEBP · maks 8</span></label>{uploadFiles.length > 0 && <div className="image-queue">{uploadFiles.map((item) => <figure key={item.sourceId}><img src={item.url} alt={item.file.name} /><figcaption title={item.file.name}>{item.file.name}</figcaption><button type="button" onClick={() => { URL.revokeObjectURL(item.url); setUploadFiles((all) => all.filter((file) => file.sourceId !== item.sourceId)); }} aria-label={`Fjern ${item.file.name}`}><X size={14} /></button></figure>)}</div>}{ocrBusy && <div className="ocr-progress"><div><Loader2 className="spin" size={17} /><span>{detectedRegions ? `${detectedRegions} kupongområder funnet` : 'Deler bildet i kuponger'} · {Math.round(ocrProgress * 100)} %</span></div><i style={{ width: `${Math.round(ocrProgress * 100)}%` }} /></div>}</> : <label className="text-source">Kupongtekst<textarea value={importText} onChange={(event) => setImportText(event.target.value)} placeholder={'Lim inn én eller flere kvitteringer her…\n\nInnsats: 100,00\nOdds: 2.10\nMulig Premie: 210,00\n1. Norge v England\nStarttid: 11/7 23:00\nSpillobjekt: Scorer mål\nSpilt utfall: Erling Haaland'} /></label>}
             {importError && <p className="import-error">{importError}</p>}
           </div>}
           {importStep === 'review' && <div className="import-body review-body">
@@ -2165,7 +2440,7 @@ export function OddsenTracker() {
               return <article className={`review-card ${errors.length ? 'is-invalid' : 'is-valid'}`} key={item.id}>
                 <div className="review-card-head"><strong>Spillvalg {index + 1}</strong><span>{item.sourceName || 'Manuelt registrert'}</span><em>{errors.length ? `${errors.length} feil` : 'Klar'}</em><button type="button" onClick={() => setDrafts((all) => all.filter((row) => row.id !== item.id))} aria-label={`Fjern spillvalg ${index + 1}`}><Trash2 size={15} /></button></div>
                 {item.sourcePreview && <img className="review-preview" src={item.sourcePreview} alt={`Bildeutdrag for spillvalg ${index + 1}`} />}
-                <div className="review-grid"><label className="wide">Kamp<input value={item.match} onChange={(event) => updateDraft(item.id, 'match', event.target.value)} placeholder="Norge v England" /></label><label>Starttid<input value={item.kickoff} onChange={(event) => updateDraft(item.id, 'kickoff', event.target.value)} /></label><label>Turnering<input value={item.competition} onChange={(event) => updateDraft(item.id, 'competition', event.target.value)} /></label><label className="wide">Marked<input value={item.market} onChange={(event) => updateDraft(item.id, 'market', event.target.value)} /></label><label className="wide">Spillvalg<input value={item.selection} onChange={(event) => updateDraft(item.id, 'selection', event.target.value)} /></label><label>Odds<input inputMode="decimal" value={item.odds} onChange={(event) => updateDraft(item.id, 'odds', event.target.value)} /></label><label>Innsats<input inputMode="decimal" value={item.stake} onChange={(event) => updateDraft(item.id, 'stake', event.target.value)} /></label><label>Mulig premie<input inputMode="decimal" value={item.payout} onChange={(event) => updateDraft(item.id, 'payout', event.target.value)} /></label><label>Kategori<select value={item.category} onChange={(event) => updateDraft(item.id, 'category', event.target.value)}>{CATEGORIES.slice(1).map((category) => <option key={category}>{category}</option>)}</select></label><label className="wide">Kupongnummer<input value={item.coupon} onChange={(event) => updateDraft(item.id, 'coupon', event.target.value)} /></label></div>
+                <div className="review-grid"><label className="wide">Kamp<input value={item.match} onChange={(event) => updateDraft(item.id, 'match', event.target.value)} placeholder="Norge vs England" /></label><label>Starttid<input value={item.kickoff} onChange={(event) => updateDraft(item.id, 'kickoff', event.target.value)} placeholder="DD.MM.YYYY HH:MM" /></label><label>Turnering<textarea rows={2} value={item.competition} onChange={(event) => updateDraft(item.id, 'competition', event.target.value)} /></label><label className="wide">Marked<input value={item.market} onChange={(event) => updateDraft(item.id, 'market', event.target.value)} /></label><label className="wide">Spillvalg<input value={item.selection} onChange={(event) => updateDraft(item.id, 'selection', event.target.value)} /></label><label>Odds<input inputMode="decimal" value={item.odds} onChange={(event) => updateDraft(item.id, 'odds', event.target.value)} /></label><label>Innsats<input inputMode="decimal" value={item.stake} onChange={(event) => updateDraft(item.id, 'stake', event.target.value)} /></label><label>Mulig premie<input inputMode="decimal" value={item.payout} onChange={(event) => updateDraft(item.id, 'payout', event.target.value)} /></label><label>Kategori<select value={item.category} onChange={(event) => updateDraft(item.id, 'category', event.target.value)}>{CATEGORIES.slice(1).map((category) => <option key={category}>{category}</option>)}</select></label><label className="wide">Kupongnummer<input value={item.coupon} onChange={(event) => updateDraft(item.id, 'coupon', event.target.value)} /></label></div>
                 {errors.length > 0 && <ul className="review-errors">{errors.map((error) => <li key={error}>{error}</li>)}</ul>}
               </article>;
             })}</div>
@@ -2179,8 +2454,8 @@ export function OddsenTracker() {
               {importStep === 'success' && <button type="button" className="secondary-button import-more-button" onClick={beginAdditionalImport}><Upload size={16} /> Importer flere kuponger</button>}
             </div>
             <div>
-              {importStep === 'source' && <button type="button" className="primary-button" disabled={ocrBusy} onClick={processSource}>{ocrBusy ? <Loader2 className="spin" size={17} /> : importMode === 'image' ? <ImageIcon size={17} /> : <FileText size={17} />}{ocrBusy ? 'Leser bilder' : importMode === 'image' ? 'Les skjermbilder' : 'Finn kuponger'}</button>}
-              {importStep === 'review' && <><button type="button" className="secondary-button" onClick={() => setDrafts((all) => [...all, draft()])}><Plus size={16} /> Legg til rad</button><button type="button" className="primary-button" onClick={commitImport}><Check size={17} /> Lagre kuponger</button></>}
+              {importStep === 'source' && (importMode === 'text' || uploadFiles.length > 0) && <button type="button" className="primary-button" disabled={ocrBusy} onClick={processSource}>{ocrBusy ? <Loader2 className="spin" size={17} /> : importMode === 'image' ? <ImageIcon size={17} /> : <FileText size={17} />}{ocrBusy ? 'Leser bilder' : importMode === 'image' ? 'Les skjermbilder' : 'Finn kuponger'}</button>}
+              {importStep === 'review' && <><button type="button" className="secondary-button" onClick={() => setDrafts((all) => [...all, draft()])}><Plus size={16} /> Legg til rad</button><button type="button" className="primary-button" disabled={!drafts.length || drafts.some((item) => draftErrors(item).length > 0)} onClick={commitImport} title={drafts.some((item) => draftErrors(item).length > 0) ? 'Rett kritiske feltfeil før lagring' : undefined}><Check size={17} /> Lagre kuponger</button></>}
               {importStep === 'success' && <button type="button" className="primary-button" onClick={closeImport}>Ferdig</button>}
             </div>
           </footer>
