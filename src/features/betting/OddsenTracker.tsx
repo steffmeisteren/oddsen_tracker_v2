@@ -1518,10 +1518,108 @@ function readStoredBets(): TrackedBet[] {
   catch { return []; }
 }
 
+type CountryFlagId = 'norway' | 'england' | 'spain' | 'belgium';
+
+interface TeamPresentation {
+  name: string;
+  code: string;
+  flag?: CountryFlagId;
+}
+
+const teamsByName: Record<string, TeamPresentation> = {
+  norge: { name: 'Norge', code: 'NOR', flag: 'norway' },
+  norway: { name: 'Norge', code: 'NOR', flag: 'norway' },
+  england: { name: 'England', code: 'ENG', flag: 'england' },
+  spania: { name: 'Spania', code: 'ESP', flag: 'spain' },
+  spain: { name: 'Spania', code: 'ESP', flag: 'spain' },
+  belgia: { name: 'Belgia', code: 'BEL', flag: 'belgium' },
+  belgium: { name: 'Belgia', code: 'BEL', flag: 'belgium' },
+};
+
+function teamKey(name: string) {
+  return name
+    .trim()
+    .toLocaleLowerCase('nb-NO')
+    .replace(/æ/g, 'ae')
+    .replace(/ø/g, 'o')
+    .replace(/å/g, 'a')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function presentTeam(name: string): TeamPresentation {
+  const trimmedName = name.trim();
+  const known = teamsByName[teamKey(trimmedName)];
+  if (known) return known;
+
+  return {
+    name: trimmedName,
+    code: trimmedName.replace(/[^A-Za-zÆØÅæøå]/g, '').slice(0, 3).toUpperCase() || 'VM',
+  };
+}
+
 function teamCodes(label: string) {
   const parts = label.split(/\s+(?:v|vs\.?|mot)\s+/i);
-  const code = (name: string) => name.replace(/[^A-Za-zÆØÅæøå]/g, '').slice(0, 3).toUpperCase() || 'VM';
-  return parts.length > 1 ? { home: code(parts[0]), away: code(parts[1]), special: false } : { home: 'VM', away: '26', special: true };
+  return parts.length > 1
+    ? { home: presentTeam(parts[0]), away: presentTeam(parts[1]), special: false as const }
+    : { home: undefined, away: undefined, special: true as const };
+}
+
+function kickoffPresentation(value: string) {
+  const parsed = value.match(/^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}:\d{2})$/);
+  if (!parsed) {
+    const fallback = value.match(/^(.*?)\s+(\d{1,2}:\d{2})$/);
+    return {
+      date: fallback?.[1] || value,
+      time: fallback?.[2] || '',
+      dateTime: undefined,
+    };
+  }
+
+  const [, day, month, year, time] = parsed;
+  const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+  return {
+    date: new Intl.DateTimeFormat('nb-NO', {
+      weekday: 'short',
+      day: 'numeric',
+      month: 'long',
+      timeZone: 'UTC',
+    }).format(date),
+    time,
+    dateTime: `${year}-${month}-${day}T${time}`,
+  };
+}
+
+function CountryFlag({ id }: { id: CountryFlagId }) {
+  return (
+    <span className="country-flag" aria-hidden="true">
+      {id === 'norway' && (
+        <svg viewBox="0 0 24 16" focusable="false">
+          <rect width="24" height="16" fill="#ba0c2f" />
+          <path d="M0 8h24M9 0v16" stroke="#fff" strokeWidth="5" />
+          <path d="M0 8h24M9 0v16" stroke="#00205b" strokeWidth="2.5" />
+        </svg>
+      )}
+      {id === 'england' && (
+        <svg viewBox="0 0 24 16" focusable="false">
+          <rect width="24" height="16" fill="#fff" />
+          <path d="M0 8h24M12 0v16" stroke="#ce1124" strokeWidth="3.2" />
+        </svg>
+      )}
+      {id === 'spain' && (
+        <svg viewBox="0 0 24 16" focusable="false">
+          <rect width="24" height="16" fill="#aa151b" />
+          <rect y="4" width="24" height="8" fill="#f1bf00" />
+        </svg>
+      )}
+      {id === 'belgium' && (
+        <svg viewBox="0 0 24 16" focusable="false">
+          <rect width="8" height="16" fill="#111" />
+          <rect x="8" width="8" height="16" fill="#fdda24" />
+          <rect x="16" width="8" height="16" fill="#ef3340" />
+        </svg>
+      )}
+    </span>
+  );
 }
 
 function couponKey(bet: TrackedBet) { return bet.coupon || bet.couponGroupId || bet.id; }
@@ -1537,6 +1635,59 @@ function trackedSummary(items: TrackedBet[]) {
     highest: unique.reduce((max, bet) => Math.max(max, bet.odds), 0),
     averageOdds: unique.length ? unique.reduce((sum, bet) => sum + bet.odds, 0) / unique.length : 0,
   };
+}
+
+interface MatchCouponBuilderProps {
+  match: string;
+  selectedCount: number;
+  summary: ReturnType<typeof trackedSummary>;
+  onClear: () => void;
+}
+
+function MatchCouponBuilder({ match, selectedCount, summary, onClear }: MatchCouponBuilderProps) {
+  const possibleNet = Math.max(0, summary.payout - summary.stake);
+
+  return (
+    <section
+      className="match-coupon-builder"
+      aria-label={`Kupongbygger for ${match}`}
+      aria-live="polite"
+      aria-atomic="true"
+    >
+      <div className="match-builder-copy">
+        <span className="match-builder-icon" aria-hidden="true">
+          <Check size={16} strokeWidth={3} />
+        </span>
+        <div>
+          <span className="eyebrow">Kampkupong</span>
+          <strong>{selectedCount} spill valgt</strong>
+          <small>{match}</small>
+        </div>
+      </div>
+      <dl className="match-builder-metrics">
+        <div>
+          <dt>Samlet innsats</dt>
+          <dd>{money.format(summary.stake)} kr</dd>
+        </div>
+        <div className="positive">
+          <dt>Mulig premie</dt>
+          <dd>{money.format(summary.payout)} kr</dd>
+        </div>
+        <div className="positive">
+          <dt>Netto gevinst</dt>
+          <dd>+{money.format(possibleNet)} kr</dd>
+        </div>
+      </dl>
+      <button
+        type="button"
+        className="match-builder-clear"
+        onClick={onClear}
+        aria-label={`Fjern markerte spill for ${match}`}
+      >
+        Fjern valgene
+      </button>
+    </section>
+  );
 }
 
 export function OddsenTracker() {
@@ -1568,14 +1719,15 @@ export function OddsenTracker() {
 
   const totals = useMemo(() => trackedSummary(bets), [bets]);
   const matchGroups = useMemo(() => [...new Set(bets.map((bet) => bet.match))].map((match) => ({ match, bets: bets.filter((bet) => bet.match === match) })), [bets]);
-  const chosen = bets.filter((bet) => selected.has(bet.id));
-  const chosenSummary = trackedSummary(chosen);
-  const selectedStake = chosenSummary.stake;
-  const selectedPayout = chosenSummary.payout;
   const draftCouponCount = new Set(drafts.map((item) => item.coupon || item.groupId)).size;
 
   function toggleBet(id: string) {
     setSelected((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
+  }
+
+  function clearSelectedForMatch(match: string) {
+    const matchIds = new Set(bets.filter((bet) => bet.match === match).map((bet) => bet.id));
+    setSelected((current) => new Set([...current].filter((id) => !matchIds.has(id))));
   }
 
   function handleRowKeyDown(event: KeyboardEvent<HTMLElement>, id: string) {
@@ -1794,8 +1946,8 @@ export function OddsenTracker() {
     <div className="odds-page" data-theme={theme}>
       <div className="odds-atmosphere" aria-hidden="true" />
       <main className="tracker-shell">
-        <nav className="tracker-nav" aria-label="Oddsen-Tracker">
-          <a className="tracker-brand" href="#top" aria-label="Oddsen-Tracker, til toppen"><span className="brand-orbit"><Trophy size={17} /></span><span><strong>Oddsen-Tracker</strong><small>Din personlige kupongoversikt</small></span></a>
+        <nav className="tracker-nav" aria-label="Oddsen Tracker">
+          <a className="tracker-brand" href="#top" aria-label="Oddsen Tracker, til toppen"><span className="brand-orbit"><Trophy size={17} /></span><span><strong>Oddsen Tracker</strong><small>Din personlige kupongoversikt</small></span></a>
           <div className="nav-actions">
             {bets.length > 0 && <button className="nav-import" type="button" onClick={() => openImport('image')}><Upload size={15} /><span>Importer kupong</span></button>}
             <button className="theme-toggle" type="button" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} aria-label={`Bytt til ${theme === 'dark' ? 'lyst' : 'mørkt'} tema`}><Sun className="sun-icon" size={17} /><Moon className="moon-icon" size={17} /></button>
@@ -1803,36 +1955,191 @@ export function OddsenTracker() {
         </nav>
 
         <section id="top" className="world-cup-hero" style={{ '--hero-image': `url(${heroImage})` } as CSSProperties} aria-labelledby="hero-title">
-          <div className="hero-copy"><span className="hero-kicker">Nord-Amerika 2026 · Turneringsoversikt</span><h1 id="hero-title">Fotball-VM <em>2026</em></h1><p>De største kampene og alle VM-kupongene dine, samlet i én kompromissløs premiumoversikt.</p><div className="market-pills"><span>Kampvinner</span><span>Målscorer</span><span>Toppscorer-odds</span><span>Turneringsvinner</span></div></div>
+          <div className="hero-copy"><span className="hero-kicker">Nord-Amerika 2026 · Turneringsoversikt</span><h1 id="hero-title">Fotball-VM <em>2026</em></h1><p>Samle VM-kupongene dine og følg innsats, odds og mulig premie på ett sted.</p><div className="market-pills"><span>Kampvinner</span><span>Målscorer</span><span>Toppscorer-odds</span><span>Turneringsvinner</span></div></div>
           <div className="hero-badge" aria-hidden="true"><b>26</b><span>World Cup</span></div>
           <dl className="hero-stats"><div><dt>VM-kuponger</dt><dd>{totals.coupons}</dd></div><div><dt>VM-innsats</dt><dd>{money.format(totals.stake)} kr</dd></div><div><dt>Høyeste odds</dt><dd>{totals.highest ? totals.highest.toFixed(2) : '—'}</dd></div></dl>
         </section>
 
         <section className="overview-card" aria-labelledby="overview-title">
-          <div className="overview-copy"><span className="section-kicker">Oddsenoversikt</span><h2 id="overview-title">Mine <em>spill</em></h2><p>{bets.length ? 'Alle kuponger og spillvalg samlet på ett sted. Bruk importsnarveien øverst når du vil legge til flere.' : 'Arbeidsområdet er tomt. Start med skjermbilder, kupongtekst eller manuell registrering i importfeltet under.'}</p></div>
-          <dl className="overview-stats"><div><dt>Aktive kuponger</dt><dd>{totals.coupons}</dd></div><div><dt>Total innsats</dt><dd>{money.format(totals.stake)} kr</dd></div><div><dt>Største enkeltpremie</dt><dd>{money.format(bets.reduce((max, bet) => Math.max(max, bet.payout), 0))} kr</dd></div><div><dt>Snittodds</dt><dd>{totals.averageOdds ? totals.averageOdds.toFixed(2) : '—'}</dd></div></dl>
+          <div className="overview-copy"><span className="section-kicker">Oversikt</span><h2 id="overview-title">Mine <em>spill</em></h2><p>{bets.length ? 'Følg innsats, odds og mulig premie per kamp. Marker spill for å bygge en kampkupong.' : 'Arbeidsområdet er tomt. Start med skjermbilder, kupongtekst eller manuell registrering i importfeltet under.'}</p></div>
+          <dl className="overview-stats"><div><dt>Kuponger</dt><dd>{totals.coupons}</dd></div><div><dt>Total innsats</dt><dd>{money.format(totals.stake)} kr</dd></div><div><dt>Høyeste mulige premie</dt><dd>{money.format(bets.reduce((max, bet) => Math.max(max, bet.payout), 0))} kr</dd></div><div><dt>Gjennomsnittlig odds</dt><dd>{totals.averageOdds ? totals.averageOdds.toFixed(2) : '—'}</dd></div></dl>
         </section>
 
         {bets.length > 0 ? <>
-          <section className="selection-bar" aria-live="polite"><div className="selection-copy"><span>Kupongbygger</span><strong>{chosen.length ? `${chosen.length} markert` : 'Marker spill'}</strong><small>Klikk direkte på en rad for å velge den.</small></div><div><span>Innsats</span><strong>{money.format(selectedStake)} kr</strong></div><div className="positive"><span>Mulig premie</span><strong>{money.format(selectedPayout)} kr</strong></div><div className="positive"><span>Mulig netto</span><strong>+{money.format(Math.max(0, selectedPayout - selectedStake))} kr</strong></div><button type="button" onClick={() => setSelected(new Set())} disabled={!chosen.length}>Nullstill</button></section>
           {matchGroups.map((group) => {
-            const filter = filters[group.match] || 'Alle'; const visible = filter === 'Alle' ? group.bets : group.bets.filter((bet) => bet.category === filter);
+            const filter = filters[group.match] || 'Alle';
+            const visible = filter === 'Alle' ? group.bets : group.bets.filter((bet) => bet.category === filter);
             const groupTotals = trackedSummary(group.bets);
-            const codes = teamCodes(group.match); const lead = group.bets[0];
-            return <section className="match-card" key={group.match} aria-label={group.match}>
-              <header className="match-header"><div><span className="section-kicker">{lead.competition || 'Fotball-VM 2026'} / Kamp</span><time className="match-kickoff">{lead.kickoff}</time><h2>{codes.special ? <strong className="event-title">{group.match}</strong> : <><b>{codes.home}</b><i>VS</i><b>{codes.away}</b></>}</h2></div><div className="match-header-side"><dl><div><dt>Kuponger</dt><dd>{groupTotals.coupons}</dd></div><div><dt>Satset</dt><dd>{money.format(groupTotals.stake)} kr</dd></div><div><dt>Toppodds</dt><dd>{groupTotals.highest.toFixed(2)}</dd></div></dl><button className="match-delete-button" type="button" onClick={() => confirmAndRemoveMatch(group.match)} aria-label={`Slett ${group.match} og alle tilhørende kuponger`} title="Slett kampen og alle kuponger som inneholder den"><Trash2 size={16} /> Slett kamp og kuponger</button></div></header>
-              <div className="filter-bar" aria-label={`Filtrer spill for ${group.match}`}>{CATEGORIES.map((category) => { const count = category === 'Alle' ? group.bets.length : group.bets.filter((bet) => bet.category === category).length; if (category !== 'Alle' && !count) return null; return <button key={category} type="button" className={filter === category ? 'active' : ''} aria-pressed={filter === category} onClick={() => setFilters((all) => ({ ...all, [group.match]: category }))}>{category}<span>{count}</span></button>; })}</div>
-              <div className="sort-guide"><GripVertical size={20} strokeWidth={2.4} /><span>Dra radene for å endre rekkefølge</span></div>
-              <div className="bet-columns" aria-hidden="true"><span /><span>Type og spill</span><span>Odds</span><span>Innsats</span><span>Mulig premie</span><span /></div>
-              <div className="bet-list" role="listbox" aria-label={`Spill for ${group.match}`} aria-multiselectable="true">{visible.map((bet) => {
-                const isSelected = selected.has(bet.id); const dropClass = dropTarget?.id === bet.id ? `drop-${dropTarget.edge}` : '';
-                const key = couponKey(bet); const couponBetCount = bets.filter((item) => couponKey(item) === key).length;
-                return <article key={bet.id} className={`bet-row category-${categoryClass[bet.category]} ${isSelected ? 'selected' : ''} ${draggedId === bet.id ? 'dragging' : ''} ${settlingId === bet.id ? 'settling' : ''} ${dropClass}`} draggable onDragStart={(event) => beginDrag(event, bet.id)} onDragOver={(event) => markDrop(event, bet.id)} onDrop={finishDrop} onDragEnd={endDrag} onClick={() => toggleBet(bet.id)} onKeyDown={(event) => handleRowKeyDown(event, bet.id)} role="option" tabIndex={0} aria-selected={isSelected} aria-label={`${bet.market}: ${bet.selection}`}><span className="drag-control" aria-hidden="true" title="Dra for å endre rekkefølge"><GripVertical size={24} strokeWidth={2.4} /></span><div className="bet-main"><span><i>{categoryCode[bet.category]}</i>{bet.market}{bet.coupon && <small className="coupon-reference">Kupong {bet.coupon}</small>}</span><strong>{bet.selection}</strong></div><div className="bet-number odds"><span>Odds</span><strong>{bet.odds.toFixed(2)}</strong></div><div className="bet-number"><span>Innsats</span><strong>{money.format(bet.stake)} kr</strong></div><div className="bet-number payout"><span>Mulig premie</span><strong>{money.format(bet.payout)} kr</strong><small>+{money.format(bet.payout - bet.stake)} kr netto</small></div><button className="delete-bet" type="button" onClick={(event) => { event.stopPropagation(); if (window.confirm(`Slett kupong${bet.coupon ? ` ${bet.coupon}` : ''}? Dette fjerner ${couponBetCount} ${couponBetCount === 1 ? 'spillvalg' : 'spillvalg'}.`)) removeCoupon(key); }} aria-label={`Slett hele kupong${bet.coupon ? ` ${bet.coupon}` : ''}`} title="Slett hele kupongen"><Trash2 size={18} /><span className="sr-only">Slett hele kupongen</span></button></article>;
-              })}</div>
-              <footer className="match-footer"><span>{visible.length} av {group.bets.length} spillvalg · {groupTotals.coupons} {groupTotals.coupons === 1 ? 'kupong' : 'kuponger'}</span><strong>Total mulig utbetaling {money.format(groupTotals.payout)} kr</strong></footer>
-            </section>;
+            const groupChosen = group.bets.filter((bet) => selected.has(bet.id));
+            const groupChosenSummary = trackedSummary(groupChosen);
+            const matchup = teamCodes(group.match);
+            const lead = group.bets[0];
+            const kickoff = kickoffPresentation(lead.kickoff);
+
+            return (
+              <section className="match-card" key={group.match} aria-label={group.match}>
+                <header className="match-header">
+                  <div className="match-header-main">
+                    <div className="match-meta-line">
+                      <span className="section-kicker">{lead.competition || 'Fotball-VM 2026'}</span>
+                    </div>
+                    <time className="match-kickoff" dateTime={kickoff.dateTime}>
+                      <span>{kickoff.date}</span>
+                      {kickoff.time && <strong>{kickoff.time}</strong>}
+                    </time>
+                    {matchup.special ? (
+                      <h2 className="event-match-title">
+                        <strong>{group.match}</strong>
+                      </h2>
+                    ) : (
+                      <h2 className="match-versus" aria-label={`${matchup.home.name} mot ${matchup.away.name}`}>
+                        <span className="match-team">
+                          {matchup.home.flag && <CountryFlag id={matchup.home.flag} />}
+                          <span className="team-wordmark">
+                            <b>{matchup.home.code}</b>
+                          </span>
+                        </span>
+                        <i aria-hidden="true">VS</i>
+                        <span className="match-team">
+                          {matchup.away.flag && <CountryFlag id={matchup.away.flag} />}
+                          <span className="team-wordmark">
+                            <b>{matchup.away.code}</b>
+                          </span>
+                        </span>
+                      </h2>
+                    )}
+                  </div>
+                  <div className="match-header-side">
+                    <dl>
+                      <div><dt>Kuponger</dt><dd>{groupTotals.coupons}</dd></div>
+                      <div><dt>Innsats</dt><dd>{money.format(groupTotals.stake)} kr</dd></div>
+                      <div><dt>Høyeste odds</dt><dd>{groupTotals.highest.toFixed(2)}</dd></div>
+                    </dl>
+                    <button
+                      className="match-delete-button"
+                      type="button"
+                      onClick={() => confirmAndRemoveMatch(group.match)}
+                      aria-label={`Slett ${group.match} og alle tilhørende kuponger`}
+                      title="Slett kampen og alle kuponger som inneholder den"
+                    >
+                      <Trash2 size={14} /> Slett kamp
+                    </button>
+                  </div>
+                </header>
+
+                <div className="filter-bar" aria-label={`Filtrer spill for ${group.match}`}>
+                  <div className="filter-tabs">
+                    {CATEGORIES.map((category) => {
+                      const count = category === 'Alle' ? group.bets.length : group.bets.filter((bet) => bet.category === category).length;
+                      if (category !== 'Alle' && !count) return null;
+
+                      return (
+                        <button
+                          key={category}
+                          type="button"
+                          className={filter === category ? 'active' : ''}
+                          aria-pressed={filter === category}
+                          onClick={() => setFilters((all) => ({ ...all, [group.match]: category }))}
+                        >
+                          {category}<span>{count}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <span className="sort-guide">
+                    <GripVertical size={18} strokeWidth={2.4} />
+                    <span>Dra for å sortere</span>
+                  </span>
+                </div>
+                <div className="bet-columns" aria-hidden="true">
+                  <span /><span>Marked og spillvalg</span><span>Odds</span><span>Innsats</span><span>Mulig premie</span><span />
+                </div>
+                <div className="bet-list" role="listbox" aria-label={`Spill for ${group.match}`} aria-multiselectable="true">
+                  {visible.map((bet) => {
+                    const isSelected = selected.has(bet.id);
+                    const dropClass = dropTarget?.id === bet.id ? `drop-${dropTarget.edge}` : '';
+                    const key = couponKey(bet);
+                    const couponBetCount = bets.filter((item) => couponKey(item) === key).length;
+                    const netPayout = bet.payout - bet.stake;
+
+                    return (
+                      <article
+                        key={bet.id}
+                        className={`bet-row category-${categoryClass[bet.category]} ${draggedId === bet.id ? 'dragging' : ''} ${settlingId === bet.id ? 'settling' : ''} ${dropClass}`}
+                        draggable
+                        onDragStart={(event) => beginDrag(event, bet.id)}
+                        onDragOver={(event) => markDrop(event, bet.id)}
+                        onDrop={finishDrop}
+                        onDragEnd={endDrag}
+                        onClick={() => toggleBet(bet.id)}
+                        onKeyDown={(event) => handleRowKeyDown(event, bet.id)}
+                        role="option"
+                        tabIndex={0}
+                        aria-selected={isSelected}
+                        aria-label={`${bet.category}. ${bet.market}: ${bet.selection}`}
+                      >
+                        <span className="drag-control" aria-hidden="true" title="Dra for å endre rekkefølge">
+                          <GripVertical size={22} strokeWidth={2.4} />
+                        </span>
+                        <div className="bet-main">
+                          <span className="bet-description">
+                            <i className="category-badge" title={bet.category} aria-hidden="true">{categoryCode[bet.category]}</i>
+                            <span className="bet-market">{bet.market}</span>
+                            {bet.coupon && <small className="coupon-reference">Kupong {bet.coupon}</small>}
+                            {isSelected && (
+                              <span className="selected-indicator" aria-hidden="true">
+                                <Check size={12} strokeWidth={3} /> Valgt
+                              </span>
+                            )}
+                          </span>
+                          <strong className="bet-title">{bet.selection}</strong>
+                        </div>
+                        <div className="bet-number bet-odds">
+                          <span>Odds</span>
+                          <strong>{bet.odds.toFixed(2)}</strong>
+                        </div>
+                        <div className="bet-number bet-stake">
+                          <span>Innsats</span>
+                          <strong>{money.format(bet.stake)} kr</strong>
+                        </div>
+                        <div className="bet-number bet-payout">
+                          <span>Mulig premie</span>
+                          <strong>{money.format(bet.payout)} kr</strong>
+                          <small>{netPayout > 0 ? '+' : netPayout < 0 ? '−' : ''}{money.format(Math.abs(netPayout))} kr netto</small>
+                        </div>
+                        <button
+                          className="delete-bet"
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            if (window.confirm(`Slett kupong${bet.coupon ? ` ${bet.coupon}` : ''}? Dette fjerner ${couponBetCount} ${couponBetCount === 1 ? 'spillvalg' : 'spillvalg'}.`)) removeCoupon(key);
+                          }}
+                          aria-label={`Slett hele kupong${bet.coupon ? ` ${bet.coupon}` : ''}`}
+                          title="Slett hele kupongen"
+                        >
+                          <Trash2 size={17} />
+                          <span className="sr-only">Slett hele kupongen</span>
+                        </button>
+                      </article>
+                    );
+                  })}
+                </div>
+                <footer className="match-footer" aria-label={`Oppsummering for ${group.match}`}>
+                  <span>Alle kuponger · mulig premie</span>
+                  <strong>{money.format(groupTotals.payout)} kr</strong>
+                </footer>
+                {groupChosen.length > 0 && (
+                  <MatchCouponBuilder
+                    match={group.match}
+                    selectedCount={groupChosen.length}
+                    summary={groupChosenSummary}
+                    onClear={() => clearSelectedForMatch(group.match)}
+                  />
+                )}
+              </section>
+            );
           })}
-          <section className="workspace-danger-zone" aria-label="Administrer spill og kuponger"><div><strong>Nullstill hele arbeidsområdet</strong><span>Slett alle {matchGroups.length} kampkort, {bets.length} spillvalg og {totals.coupons} kuponger permanent fra denne nettleseren.</span></div><button className="delete-all-button" type="button" onClick={() => { if (window.confirm(`Slett alle spill og kuponger?\n\nDette fjerner ${matchGroups.length} kampkort, ${bets.length} spillvalg og ${totals.coupons} kuponger.\n\nHandlingen kan ikke angres.`)) removeAllGamesAndCoupons(); }}><Trash2 size={17} /> Slett alle spill og kuponger</button></section>
+          <section className="workspace-danger-zone" aria-label="Administrer spill og kuponger"><div><strong>Slett alle kuponger</strong><span>Fjerner {matchGroups.length} {matchGroups.length === 1 ? 'kamp' : 'kamper'}, {bets.length} spillvalg og {totals.coupons} kuponger fra denne nettleseren.</span></div><button className="delete-all-button" type="button" onClick={() => { if (window.confirm(`Slett alle spill og kuponger?\n\nDette fjerner ${matchGroups.length} kampkort, ${bets.length} spillvalg og ${totals.coupons} kuponger.\n\nHandlingen kan ikke angres.`)) removeAllGamesAndCoupons(); }}><Trash2 size={17} /> Slett alle spill og kuponger</button></section>
         </> : <section className="empty-dashboard" aria-labelledby="empty-dashboard-title"><button className="empty-visual" type="button" onClick={() => openImport('image')} aria-label="Åpne import av kupong" title="Importer kupong"><Upload size={28} /></button><span className="section-kicker">Arbeidsområdet er klart</span><h2 id="empty-dashboard-title">Importer din første kupong</h2><p>Klikk på ikonet for å starte med skjermbilder. Kupongtekst og manuell registrering velges i samme importdialog.</p><div className="empty-methods" aria-label="Tilgjengelige importmetoder"><span><ImageIcon size={13} /> Skjermbilder</span><span><FileText size={13} /> Kupongtekst</span><span><Plus size={13} /> Manuelt</span></div></section>}
       </main>
 
