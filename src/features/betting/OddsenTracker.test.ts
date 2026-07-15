@@ -5,20 +5,27 @@ import {
   detectCouponBoxes,
   detectOcrGridBoxes,
   draftErrors,
+  draftWarnings,
   evaluateImportFileSelection,
   getImportFailureMessage,
+  getImageSelectionLabel,
+  getSegmentationDimensions,
   getImportOcrConcurrency,
   getImportReviewStatus,
   getTesseractAssetPaths,
+  ImportAbortError,
   materializeMatchSort,
   mergePositionedWithText,
   nextBetSort,
+  normalizeNorwegianBetText,
   openImportFilePicker,
   parseCouponText,
   parsePositionedCoupon,
   processImportSourcesInOrder,
   readImportFileSelection,
+  recoverImportSourcePreview,
   releaseImportSourcePreview,
+  runTwoPhaseImportQueue,
   sortBetsForDisplay,
   validateImportForPersistence,
   type TrackedBet,
@@ -30,6 +37,36 @@ afterEach(() => {
 });
 
 describe('kupongimport', () => {
+  it.each([
+    ['Scorer begge lagi 1 omgang?', 'market', 'Scorer begge lag i 1. omgang?'],
+    ['Scorer begge lag i 2 omgang?', 'market', 'Scorer begge lag i 2. omgang?'],
+    ['Mal scoret på direkte frispark', 'market', 'Mål scoret på direkte frispark'],
+    ['scorer mal i 1 omgang', 'selection', 'scorer mål i 1. omgang'],
+    ['Antall mal over 2.5', 'market', 'Antall mål over 2.5'],
+    ['MAL?', 'market', 'MÅL?'],
+    ['Scorer begge lag i 1. omgang?', 'market', 'Scorer begge lag i 1. omgang?'],
+    ['Scorer begge lag i 2. omgang?', 'market', 'Scorer begge lag i 2. omgang?'],
+    ['Mal Donaghy', 'selection', 'Mal Donaghy'],
+  ] as const)('normaliserer norsk fotballtekst «%s» uten å endre fritekst', (input, context, expected) => {
+    expect(normalizeNorwegianBetText(input, context)).toBe(expected);
+  });
+
+  it('bruker norsk marked-normalisering både ved parsing og ny validering', () => {
+    const [parsed] = parseCouponText(`Innsats: 100,00
+Odds: 3.65
+Mulig Premie: 365,00
+1. England v Argentina
+Starttid: Ons. 15/7 21:00
+Konkurranse: Internasjonal - Fotball-VM
+Spillobjekt: Scorer begge lagi 1 omgang?
+Spilt utfall: Ja
+Levert: 14.07.2026`);
+    const revalidated = validateImportForPersistence([{ ...parsed, market: 'Mal scoret i 2 omgang' }]);
+
+    expect(parsed.market).toBe('Scorer begge lag i 1. omgang?');
+    expect(revalidated.normalized[0].market).toBe('Mål scoret i 2. omgang');
+  });
+
   it('leser en komplett Oddsen-kvittering', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-07-12T12:00:00Z'));
@@ -182,6 +219,31 @@ Kupongnuminer: 299681614.1`;
     expect(binary.coupon).toBe('299681614.1');
     expect(merged.coupon).toBe('299681614.1');
     expect(draftErrors(merged)).toEqual([]);
+  });
+
+  it('godkjenner manglende kupongnummer med stabil intern ID og feltbasert deduplisering', () => {
+    const raw = `Innsats: 100,00
+Odds: 3.65
+Mulig Premie: 365,00
+1. England v Argentina
+Starttid: Ons. 15/7 21:00
+Konkurranse: Internasjonal - Fotball-VM
+Spillobjekt: Scorer begge lag i 2. omgang?
+Spilt utfall: Ja
+Levert: 14.07.2026`;
+    const first = parseCouponText(raw, '3158.jpg')[0];
+    const second = parseCouponText(raw, '3158.jpg')[0];
+
+    const firstBatch = validateImportForPersistence([first]);
+    const duplicateBatch = validateImportForPersistence([first, second]);
+
+    expect(firstBatch.invalid).toEqual([]);
+    expect(firstBatch.ready).toHaveLength(1);
+    expect(firstBatch.normalized[0].coupon).toBe('');
+    expect(firstBatch.normalized[0].groupId).toMatch(/^intern:/);
+    expect(validateImportForPersistence([second]).normalized[0].groupId).toBe(firstBatch.normalized[0].groupId);
+    expect(duplicateBatch.ready).toHaveLength(1);
+    expect(draftWarnings(firstBatch.normalized[0])).toContain('Kupongnummer mangler. Duplikatkontroll bruker kamp, tidspunkt, marked, spillvalg og beløp.');
   });
 
   it('bygger ti separate kupongceller fra OCR-ankere i et 2 × 5-rutenett', () => {
@@ -541,6 +603,16 @@ Kupongnummer: 301646585.1`);
     expect(close).toHaveBeenCalledOnce();
   });
 
+  it('nedskalerer bare analyseflaten for svært lange bilder', () => {
+    expect(getSegmentationDimensions(945, 2048)).toEqual({ width: 945, height: 2048, scaleX: 1, scaleY: 1 });
+    const long = getSegmentationDimensions(1080, 12000);
+    expect(long.height).toBe(4096);
+    expect(long.width).toBeLessThan(1080);
+    expect(long.width * long.height).toBeLessThanOrEqual(4_000_000);
+    expect(long.scaleX).toBeCloseTo(long.width / 1080);
+    expect(long.scaleY).toBeCloseTo(long.height / 12000);
+  });
+
   it('bruker samme dekoder når en mobil-WebView avviser orienteringsvalget', async () => {
     const fallbackBitmap = { width: 2048, height: 945, close: vi.fn() } as unknown as ImageBitmap;
     const createBitmap = vi.fn()
@@ -554,6 +626,61 @@ Kupongnummer: 301646585.1`);
     expect(createBitmap).toHaveBeenNthCalledWith(1, original, { imageOrientation: 'from-image' });
     expect(createBitmap).toHaveBeenNthCalledWith(2, original);
     expect(decoded).toMatchObject({ width: 2048, height: 945, source: fallbackBitmap });
+  });
+
+  it('faller tilbake til bildeelement når Samsung avviser begge createImageBitmap-kall og Image.decode', async () => {
+    const createBitmap = vi.fn().mockRejectedValue(new Error('The source image could not be decoded'));
+    const revokeObjectURL = vi.fn();
+    let imageSource = '';
+    let imageComplete = false;
+    let onload: (() => void) | null = null;
+    const image = {
+      decoding: '',
+      naturalWidth: 945,
+      naturalHeight: 2048,
+      get complete() { return imageComplete; },
+      decode: vi.fn().mockRejectedValue(new Error('EncodingError')),
+      get src() { return imageSource; },
+      set src(value: string) {
+        imageSource = value;
+        queueMicrotask(() => {
+          imageComplete = true;
+          onload?.();
+        });
+      },
+      get onload() { return onload; },
+      set onload(value: (() => void) | null) { onload = value; },
+      onerror: null,
+    } as unknown as HTMLImageElement;
+    vi.stubGlobal('createImageBitmap', createBitmap);
+    vi.stubGlobal('URL', { createObjectURL: vi.fn(() => 'blob:samsung-fallback'), revokeObjectURL });
+    vi.stubGlobal('document', { createElement: vi.fn(() => image) });
+    const original = new File([new Uint8Array([0xff, 0xd8, 0xff])], '3158.jpg', { type: 'image/jpeg' });
+
+    const decoded = await decodeCanonicalCouponImage(original);
+
+    expect(createBitmap).toHaveBeenCalledTimes(2);
+    expect(image.decode).toHaveBeenCalledOnce();
+    expect(decoded).toMatchObject({ width: 945, height: 2048, source: image });
+    decoded.close();
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:samsung-fallback');
+  });
+
+  it('beholder originalfilen OCR-lesbar når både vanlig preview og thumbnail-fallback feiler', async () => {
+    const file = new File(['lesbar original'], '3158.jpg', { type: 'image/jpeg', lastModified: 123 });
+    const [source] = createCanonicalImportSources([file], 0, () => 'blob:broken-preview');
+    const revoke = vi.fn();
+
+    const recovered = await recoverImportSourcePreview(
+      source,
+      vi.fn().mockRejectedValue(new Error('Samsung thumbnail decode failed')),
+      revoke,
+    );
+    const [processed] = await processImportSourcesInOrder([recovered], async (item) => item.file.text());
+
+    expect(recovered).toMatchObject({ file, url: '', previewStatus: 'error' });
+    expect(revoke).toHaveBeenCalledWith('blob:broken-preview');
+    expect(processed.result).toBe('lesbar original');
   });
 
   it('behandler filer med avgrenset samtidighet, stabil rekkefølge og isolerte feil', async () => {
@@ -587,6 +714,77 @@ Kupongnummer: 301646585.1`);
     expect(settled.sort((a, b) => a - b)).toEqual([0, 1, 2, 3, 4]);
   });
 
+  it('analyserer tre bilder før den behandler samlet 10 + 1 + 1 kuponger', async () => {
+    const files = ['bulk.jpg', 'enkelt-1.jpg', 'enkelt-2.jpg'].map((name, index) => new File([name], name, {
+      type: 'image/jpeg', lastModified: index,
+    }));
+    const sources = createCanonicalImportSources(files, 0, (file) => `fixture://${file.name}`);
+    const analysisProgress: Array<[number, number]> = [];
+    const couponProgress: Array<[number, number]> = [];
+
+    const result = await runTwoPhaseImportQueue(
+      sources,
+      async (source) => {
+        await new Promise((resolve) => setTimeout(resolve, (3 - source.sourceOrder) * 2));
+        const count = source.sourceOrder === 0 ? 10 : 1;
+        return Array.from({ length: count }, (_, regionOrder) => `${source.sourceOrder}:${regionOrder}`);
+      },
+      async (_source, regions, reportCoupon) => regions.map((region) => {
+        reportCoupon();
+        return `kupong-${region}`;
+      }),
+      {
+        concurrency: 2,
+        onAnalysisProgress: (current, total) => analysisProgress.push([current, total]),
+        onCouponProgress: (current, total) => couponProgress.push([current, total]),
+      },
+    );
+
+    expect(result.totalItems).toBe(12);
+    expect(result.results).toEqual([
+      ...Array.from({ length: 10 }, (_, index) => `kupong-0:${index}`),
+      'kupong-1:0',
+      'kupong-2:0',
+    ]);
+    expect(analysisProgress.at(-1)).toEqual([3, 3]);
+    expect(couponProgress[0]).toEqual([1, 12]);
+    expect(couponProgress.at(-1)).toEqual([12, 12]);
+  });
+
+  it('avbryter aktiv fase og starter ikke flere kuponger', async () => {
+    const [source] = createCanonicalImportSources([new File(['x'], 'bulk.jpg', { type: 'image/jpeg' })], 0, () => 'fixture://bulk.jpg');
+    const controller = new AbortController();
+    let startedResolve!: () => void;
+    const started = new Promise<void>((resolve) => { startedResolve = resolve; });
+    const processed: string[] = [];
+    const running = runTwoPhaseImportQueue(
+      [source],
+      async () => ['første', 'andre'],
+      async (_item, regions, reportCoupon, signal) => {
+        for (const region of regions) {
+          processed.push(region);
+          startedResolve();
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(resolve, 100);
+            signal?.addEventListener('abort', () => {
+              clearTimeout(timer);
+              reject(new ImportAbortError());
+            }, { once: true });
+          });
+          reportCoupon();
+        }
+        return regions;
+      },
+      { signal: controller.signal },
+    );
+
+    await started;
+    controller.abort();
+
+    await expect(running).rejects.toBeInstanceOf(ImportAbortError);
+    expect(processed).toEqual(['første']);
+  });
+
   it('tillater 50 bildefiler, advarer over 20 og blokkerer hele tillegget over 50', () => {
     const images = Array.from({ length: 51 }, (_, index) => new File([String(index)], `bilde-${index + 1}.jpg`, { type: 'image/jpeg' }));
 
@@ -595,6 +793,11 @@ Kupongnummer: 301646585.1`);
     expect(evaluateImportFileSelection(images.slice(0, 50))).toMatchObject({ accepted: images.slice(0, 50), total: 50, error: '' });
     expect(evaluateImportFileSelection(images, 0)).toMatchObject({ accepted: [], total: 51, error: 'Du kan velge maks 50 bilder per importomgang.' });
     expect(evaluateImportFileSelection(images.slice(0, 2), 49)).toMatchObject({ accepted: [], total: 51, error: 'Du kan velge maks 50 bilder per importomgang.' });
+  });
+
+  it('viser valgt bildeantall uten å gjenta maksgrensen', () => {
+    expect(getImageSelectionLabel(1)).toBe('1 bilde valgt');
+    expect(getImageSelectionLabel(3)).toBe('3 bilder valgt');
   });
 
   it('bruker én OCR-jobb på mobil og to på desktop uten å basere seg på viewport', () => {
