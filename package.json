@@ -2,6 +2,7 @@
   "name": "oddsen-tracker",
   "private": true,
   "version": "1.0.0",
+  "packageManager": "pnpm@11.7.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
