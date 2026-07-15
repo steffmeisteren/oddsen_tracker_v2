@@ -13,6 +13,24 @@ const projection = ({ match, kickoff, competition, market, selection, odds, stak
 });
 
 describe('kanonisk kupongfixture-kontrakt', () => {
+  it('pakker worker, core og begge OCR-språk lokalt for kald GitHub Pages-lasting', () => {
+    const publicRoot = new URL('../public/ocr/tesseract/', import.meta.url);
+    const assets = [
+      'worker.min.js',
+      'core/tesseract-core-lstm.wasm.js',
+      'core/tesseract-core-simd-lstm.wasm.js',
+      'core/tesseract-core-relaxedsimd-lstm.wasm.js',
+      'lang/eng.traineddata.gz',
+      'lang/nor.traineddata.gz',
+    ];
+
+    assets.forEach((asset) => expect(readFileSync(fileURLToPath(new URL(asset, publicRoot))).length, asset).toBeGreaterThan(100_000));
+    for (const language of ['eng', 'nor']) {
+      const bytes = readFileSync(fileURLToPath(new URL(`lang/${language}.traineddata.gz`, publicRoot)));
+      expect([...bytes.subarray(0, 2)], language).toEqual([0x1f, 0x8b]);
+    }
+  });
+
   it('segmenterer hele Testkuponger-bildet til tre komplette rader og en ufullstendig siste rad', () => {
     const fixture = new URL('../src/features/betting/__fixtures__/coupon-screenshots/Testkuponger.jpg', import.meta.url);
     const bytes = readFileSync(fileURLToPath(fixture));

@@ -425,7 +425,6 @@ button { cursor: pointer; }
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  margin-left: auto;
   color: color-mix(in srgb, var(--ink) 70%, var(--ink-muted));
   font-size: var(--type-label);
   font-weight: 700;
@@ -433,8 +432,18 @@ button { cursor: pointer; }
 }
 .sort-guide svg { flex: 0 0 auto; color: color-mix(in srgb, var(--ink-muted) 78%, var(--ink)); }
 .bet-columns, .bet-row { display: grid; grid-template-columns: 44px minmax(280px, 1fr) 80px 90px 118px 44px; align-items: center; column-gap: 14px; }
-.bet-columns { min-height: 42px; padding: 0 16px; border-top: 1px solid color-mix(in srgb, var(--card-line) 76%, transparent); border-bottom: 1px solid var(--card-line); border-left: 4px solid transparent; background: color-mix(in srgb, var(--card-soft) 68%, #cbded7); color: color-mix(in srgb, var(--ink) 88%, var(--ink-muted)); font-size: 12px; font-weight: 900; letter-spacing: .05em; text-transform: uppercase; }
-.bet-columns span:nth-child(n+3):nth-child(-n+5) { text-align: right; }
+.bet-columns { min-height: 68px; grid-template-rows: 28px 34px; padding: 2px 16px 4px; border-top: 1px solid color-mix(in srgb, var(--card-line) 76%, transparent); border-bottom: 1px solid var(--card-line); border-left: 4px solid transparent; background: color-mix(in srgb, var(--card-soft) 68%, #cbded7); color: color-mix(in srgb, var(--ink) 88%, var(--ink-muted)); font-size: 12px; font-weight: 900; letter-spacing: .05em; text-transform: uppercase; }
+.bet-columns .sort-guide { grid-column: 1 / 3; grid-row: 1; justify-self: start; min-height: 26px; letter-spacing: .01em; text-transform: none; }
+.bet-description-column { grid-column: 2; grid-row: 2; }
+.bet-actions-column { grid-column: 6; grid-row: 2; }
+.bet-sort-button { min-width: 0; min-height: 32px; display: inline-flex; align-items: center; justify-content: flex-end; gap: 4px; padding: 0 5px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; font-variant-numeric: tabular-nums; }
+.bet-sort-button:hover { border-color: var(--card-line); background: rgba(255,255,255,.48); }
+.bet-sort-button:focus-visible { outline: 2px solid var(--accent-selected); outline-offset: 1px; }
+.bet-sort-button.active { border-color: color-mix(in srgb, var(--accent-selected) 62%, var(--card-line)); background: color-mix(in srgb, var(--selected-bg) 82%, var(--card)); color: var(--selected-text); }
+.bet-sort-button svg { flex: 0 0 auto; }
+.bet-sort-odds { grid-column: 3; grid-row: 2; }
+.bet-sort-stake { grid-column: 4; grid-row: 2; }
+.bet-sort-payout { grid-column: 5; grid-row: 2; }
 .bet-row {
   --category: #14836a;
   position: relative;
@@ -574,10 +583,11 @@ button { cursor: pointer; }
 .import-tabs { display: inline-grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 16px; padding: 4px; border: 1px solid var(--line); border-radius: 11px; background: color-mix(in srgb, var(--surface-raised) 55%, transparent); }
 .import-tabs button { min-height: 40px; display: flex; align-items: center; justify-content: center; gap: 7px; padding: 0 15px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font-size: 13px; font-weight: 800; }
 .import-tabs button.active { background: var(--lime); color: var(--lime-ink); }
-.dropzone { min-height: 230px; display: grid; place-items: center; align-content: center; gap: 9px; padding: 28px; border: 2px dashed color-mix(in srgb, var(--lime) 30%, var(--line)); border-radius: 14px; background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--lime) 4%, transparent) 0 13px, transparent 13px 26px), color-mix(in srgb, var(--surface-raised) 34%, transparent); color: var(--lime); text-align: center; cursor: pointer; transition: border-color .18s ease, background .18s ease; }
+.dropzone { width: 100%; min-height: 230px; display: grid; place-items: center; align-content: center; gap: 9px; padding: 28px; border: 2px dashed color-mix(in srgb, var(--lime) 30%, var(--line)); border-radius: 14px; appearance: none; background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--lime) 4%, transparent) 0 13px, transparent 13px 26px), color-mix(in srgb, var(--surface-raised) 34%, transparent); color: var(--lime); font: inherit; text-align: center; cursor: pointer; transition: border-color .18s ease, background .18s ease; }
 .dropzone:hover { border-color: var(--lime); background-color: color-mix(in srgb, var(--lime) 6%, transparent); }
-.dropzone strong { color: var(--text); font: 800 22px/1 var(--font-display); }
+.dropzone strong { color: var(--text); font: 800 22px/1.15 var(--font-display); }
 .dropzone span { color: var(--muted); font-size: 13px; }
+.image-selection-count { margin: 10px 0 0; color: var(--text); font-size: 13px; font-weight: 800; }
 .image-queue { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 9px; margin-top: 12px; }
 .image-queue figure { position: relative; min-width: 0; margin: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-raised); }
 .image-queue img { width: 100%; height: 112px; display: block; object-fit: cover; }
@@ -593,9 +603,13 @@ button { cursor: pointer; }
 .spin { animation: spin .85s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .import-error { margin: 13px 0 0; padding: 11px 13px; border-left: 3px solid var(--danger); border-radius: 7px; background: color-mix(in srgb, var(--danger) 9%, transparent); color: color-mix(in srgb, var(--danger) 82%, var(--text)); font-size: 13px; font-weight: 700; }
+.import-warning { display: flex; align-items: center; gap: 8px; margin: 10px 0 0; padding: 10px 12px; border-left: 3px solid var(--gold); border-radius: 7px; background: color-mix(in srgb, var(--gold) 9%, transparent); color: color-mix(in srgb, var(--gold) 82%, var(--text)); font-size: 13px; font-weight: 700; }
+.import-warning svg { flex: 0 0 auto; }
 .review-body { background: color-mix(in srgb, var(--surface-solid) 92%, var(--page)); }
-.review-intro { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; padding: 11px 13px; border: 1px solid color-mix(in srgb, var(--cyan) 30%, var(--line)); border-radius: 9px; background: color-mix(in srgb, var(--cyan) 8%, transparent); color: var(--cyan); }
-.review-intro p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.5; }.review-intro strong { color: var(--text); }
+.review-intro { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; padding: 11px 13px; border: 1px solid var(--line); border-radius: 9px; }
+.review-intro.is-success { border-color: color-mix(in srgb, var(--lime) 42%, var(--line)); background: color-mix(in srgb, var(--lime) 8%, transparent); color: var(--lime); }
+.review-intro.is-error { border-color: color-mix(in srgb, var(--danger) 55%, var(--line)); background: color-mix(in srgb, var(--danger) 9%, transparent); color: var(--danger); }
+.review-intro p { margin: 0; color: inherit; font-size: 14px; line-height: 1.5; }.review-intro strong { color: inherit; }
 .review-list { display: grid; gap: 10px; }
 .review-card { overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
 .review-card.is-invalid { border-color: color-mix(in srgb, var(--danger) 55%, var(--line)); box-shadow: inset 4px 0 var(--danger); }
@@ -693,9 +707,14 @@ button { cursor: pointer; }
   .match-builder-metrics div { min-width: 0; min-height: 48px; padding: 7px; }
   .match-builder-metrics dd { font-size: 15px; }
   .match-builder-clear { grid-column: 2; grid-row: 1; justify-self: end; }
-  .bet-columns { display: none; }
-  .sort-guide { width: 100%; min-height: 28px; justify-content: flex-end; margin-left: 0; font-size: var(--type-label); }
-  .sort-guide svg { width: 19px; height: 19px; }
+  .bet-columns { min-height: 78px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); grid-template-rows: 30px 40px; gap: 3px 5px; padding: 4px 10px; border-left-width: 0; }
+  .bet-columns .sort-guide { grid-column: 1 / -1; grid-row: 1; width: 100%; min-height: 28px; justify-content: flex-start; font-size: var(--type-label); }
+  .sort-guide svg { width: 18px; height: 18px; }
+  .bet-description-column, .bet-actions-column { display: none; }
+  .bet-sort-button { min-height: 38px; justify-content: center; padding: 0 4px; font-size: 10px; line-height: 1.1; white-space: normal; }
+  .bet-sort-odds { grid-column: 1; grid-row: 2; }
+  .bet-sort-stake { grid-column: 2; grid-row: 2; }
+  .bet-sort-payout { grid-column: 3; grid-row: 2; }
   .bet-row { grid-template-columns: repeat(3, minmax(0, 1fr)); row-gap: 12px; min-height: 136px; padding: 12px 10px; }
   .drag-control { position: absolute; top: 11px; left: 8px; width: 40px; min-height: 44px; margin: 0; }
   .drag-control svg { width: 24px; height: 24px; }
@@ -730,6 +749,8 @@ button { cursor: pointer; }
   .dropzone > svg { width: 26px; height: 26px; }
   .dropzone strong { font-size: 19px; }
   .dropzone span { max-width: 290px; font-size: 11px; line-height: 1.35; }
+  .image-selection-count { margin-top: 7px; font-size: 12px; }
+  .import-warning { margin-top: 7px; padding: 8px 10px; font-size: 12px; }
   .image-queue { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-top: 8px; }
   .image-queue figure { min-height: 0; border-radius: 9px; }
   .image-queue img { height: 96px; object-position: center top; }

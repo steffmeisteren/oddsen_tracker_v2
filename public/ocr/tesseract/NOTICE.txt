@@ -1,0 +1,9 @@
+Lokale OCR-ressurser
+
+- worker.min.js: tesseract.js 7.0.0
+- core/*.wasm.js: tesseract.js-core 7.0.0, LSTM-varianter
+- lang/eng.traineddata.gz: @tesseract.js-data/eng 4.0.0_best_int
+- lang/nor.traineddata.gz: @tesseract.js-data/nor 4.0.0_best_int
+
+Ressursene brukes lokalt for å unngå at produksjonsimport er avhengig av
+tredjeparts-CDN-er ved kald lasting. Se LICENSE-Apache-2.0.txt.
