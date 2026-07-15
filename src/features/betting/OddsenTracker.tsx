@@ -14,6 +14,7 @@ type Theme = 'dark' | 'light';
 export type Category = 'Kamp' | 'Spiller' | 'Timing' | 'Resultat' | 'Statistikk' | 'Spesial';
 type ImportMode = 'image' | 'text';
 type ImportStep = 'source' | 'review' | 'success';
+type ImportProgressState = { phase: 'analysis' | 'coupon'; current: number; total: number };
 
 export interface TrackedBet {
   id: string;
@@ -55,6 +56,7 @@ export interface ImportSource {
   url: string;
   sourceId: string;
   sourceOrder: number;
+  previewStatus: 'raw' | 'recovering' | 'ready' | 'error';
 }
 
 export type BetSortKey = 'odds' | 'stake' | 'payout';
@@ -99,6 +101,17 @@ export class CouponImportError extends Error {
   }
 }
 
+export class ImportAbortError extends Error {
+  constructor() {
+    super('Importen ble avbrutt.');
+    this.name = 'ImportAbortError';
+  }
+}
+
+function assertImportActive(signal?: AbortSignal): asserts signal is AbortSignal | undefined {
+  if (signal?.aborted) throw new ImportAbortError();
+}
+
 export function getImportFailureMessage(failure: Pick<CouponImportError, 'stage' | 'sourceName'>) {
   const name = failure.sourceName || 'Bildet';
   switch (failure.stage) {
@@ -130,6 +143,10 @@ export function getTesseractAssetPaths(baseUrl = import.meta.env.BASE_URL) {
 export const MAX_IMPORT_FILES = 50;
 export const LARGE_IMPORT_WARNING_THRESHOLD = 20;
 export const LARGE_IMPORT_WARNING = 'Mange bilder kan føre til lengre behandlingstid.';
+
+export function getImageSelectionLabel(count: number) {
+  return `${count} ${count === 1 ? 'bilde' : 'bilder'} valgt`;
+}
 
 interface ImportNavigatorLike {
   userAgent?: string;
@@ -184,6 +201,7 @@ export function createCanonicalImportSources(
         url: createPreviewUrl(file),
         sourceOrder,
         sourceId: `${sourceOrder}:${file.name}:${file.size}:${file.lastModified}`,
+        previewStatus: 'raw',
       };
     } catch (error) {
       throw new CouponImportError('preview', file.name, error);
@@ -199,6 +217,21 @@ const STORAGE_KEY = 'oddsen-tracker:workspace-v6';
 
 function clean(value = '') {
   return String(value).replace(/[|]/g, ' ').replace(/\s+/g, ' ').replace(/^[\s:.-]+|[\s:.-]+$/g, '').trim();
+}
+
+export function normalizeNorwegianBetText(value: string, context: 'market' | 'selection') {
+  let normalized = String(value || '');
+  normalized = normalized.replace(/\b(begge)\s+lag\s*i\b/gi, '$1 lag i');
+  normalized = normalized.replace(/\b([12])(?!\.)\s+omgang\b/gi, '$1. omgang');
+  const scoringContext = /\b(?:scor(?:e|er|et|ing)?|omgang|frispark|fotball|begge\s+lag|mål)\b/i.test(normalized)
+    || /\b(?:antall|over|under|flest|første|siste|totalt?)\b[^\n]*\bmal\b/i.test(normalized)
+    || /\bmal\b[^\n]*\b(?:antall|over|under|flest|første|siste|totalt?)\b/i.test(normalized)
+    || (context === 'market' && /^\s*mal\s*[?!]?\s*$/i.test(normalized));
+  if (scoringContext) normalized = normalized.replace(/\bmal\b/gi, (word) => {
+    if (word === word.toUpperCase()) return 'MÅL';
+    return /^[A-ZÆØÅ]/.test(word) ? 'Mål' : 'mål';
+  });
+  return normalized;
 }
 
 function cleanMatchLine(value = '') {
@@ -914,6 +947,48 @@ interface DecodedCouponImage {
   close: () => void;
 }
 
+async function decodeImageElement(sourceUrl: string, releaseSource: () => void): Promise<DecodedCouponImage> {
+  const image = document.createElement('img');
+  image.decoding = 'async';
+  const loaded = new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve();
+    image.onerror = () => reject(new Error('Kunne ikke dekode bildet.'));
+  });
+  image.src = sourceUrl;
+  let decodeError: unknown;
+  if (typeof image.decode === 'function') {
+    try { await image.decode(); } catch (error) { decodeError = error; }
+  }
+  if (!(image.naturalWidth > 0 && image.naturalHeight > 0)) {
+    try { await loaded; } catch (loadError) { releaseSource(); throw decodeError || loadError; }
+  }
+  if (!(image.naturalWidth > 0 && image.naturalHeight > 0)) {
+    releaseSource();
+    throw decodeError || new Error('Bildet mangler gyldige pikselmål.');
+  }
+  return {
+    source: image,
+    width: image.naturalWidth,
+    height: image.naturalHeight,
+    close: () => {
+      releaseSource();
+      image.onload = null;
+      image.onerror = null;
+      if (typeof image.removeAttribute === 'function') image.removeAttribute('src');
+    },
+  };
+}
+
+async function blobAsDataUrl(blob: Blob) {
+  if (typeof FileReader === 'undefined') throw new Error('FileReader er ikke tilgjengelig.');
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error || new Error('Kunne ikke lese bildefilen.'));
+    reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('Bildefilen ga ingen data.'));
+    reader.readAsDataURL(blob);
+  });
+}
+
 /**
  * Canonical decoder used for original uploads and every derived crop. The
  * intrinsic decoded pixels are the only geometry source; viewport size, CSS
@@ -926,31 +1001,62 @@ export async function decodeCanonicalCouponImage(blob: Blob): Promise<DecodedCou
       return { source: bitmap, width: bitmap.width, height: bitmap.height, close: () => bitmap.close() };
     } catch {
       // Some mobile WebViews expose createImageBitmap but reject its options.
-      const bitmap = await createImageBitmap(blob);
-      return { source: bitmap, width: bitmap.width, height: bitmap.height, close: () => bitmap.close() };
+      try {
+        const bitmap = await createImageBitmap(blob);
+        return { source: bitmap, width: bitmap.width, height: bitmap.height, close: () => bitmap.close() };
+      } catch {
+        // Samsung Internet can expose createImageBitmap while rejecting JPEGs
+        // that an ordinary image element can still decode.
+      }
     }
   }
 
   const url = URL.createObjectURL(blob);
-  const image = document.createElement('img');
-  image.decoding = 'async';
-  image.src = url;
   try {
-    if (typeof image.decode === 'function') await image.decode();
-    else await new Promise<void>((resolve, reject) => {
-      image.onload = () => resolve();
-      image.onerror = () => reject(new Error('Kunne ikke dekode bildet.'));
-    });
-  } catch (error) {
-    URL.revokeObjectURL(url);
-    throw error;
+    return await decodeImageElement(url, () => URL.revokeObjectURL(url));
+  } catch (objectUrlError) {
+    try {
+      const dataUrl = await blobAsDataUrl(blob);
+      return await decodeImageElement(dataUrl, () => undefined);
+    } catch (dataUrlError) {
+      throw dataUrlError || objectUrlError;
+    }
   }
-  return {
-    source: image,
-    width: image.naturalWidth,
-    height: image.naturalHeight,
-    close: () => URL.revokeObjectURL(url),
-  };
+}
+
+async function createImportThumbnailUrl(file: File) {
+  const decoded = await decodeCanonicalCouponImage(file);
+  const maximumDimension = 640;
+  const scale = Math.min(1, maximumDimension / Math.max(decoded.width, decoded.height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(decoded.width * scale));
+  canvas.height = Math.max(1, Math.round(decoded.height * scale));
+  try {
+    const context = canvas.getContext('2d', { alpha: false });
+    if (!context) throw new Error('Canvas er ikke tilgjengelig.');
+    context.fillStyle = '#fff';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(decoded.source, 0, 0, decoded.width, decoded.height, 0, 0, canvas.width, canvas.height);
+    return URL.createObjectURL(await canvasToBlob(canvas, 'image/jpeg', .82));
+  } finally {
+    decoded.close();
+    releaseCanvas(canvas);
+  }
+}
+
+export async function recoverImportSourcePreview(
+  source: ImportSource,
+  createPreviewUrl: (file: File) => Promise<string> = createImportThumbnailUrl,
+  revoke: (url: string) => void = (url) => URL.revokeObjectURL(url),
+): Promise<ImportSource> {
+  try {
+    const url = await createPreviewUrl(source.file);
+    releaseImportSourcePreview(source, revoke);
+    return { ...source, url, previewStatus: 'ready' };
+  } catch {
+    releaseImportSourcePreview(source, revoke);
+    return { ...source, url: '', previewStatus: 'error' };
+  }
 }
 
 function otsuThreshold(histogram: Uint32Array, total: number) {
@@ -1126,16 +1232,43 @@ async function prepareCouponCanvas(
   }
 }
 
+export function getSegmentationDimensions(width: number, height: number) {
+  const maximumPixels = 4_000_000;
+  const maximumEdge = 4096;
+  const pixelScale = Math.sqrt(maximumPixels / Math.max(1, width * height));
+  const edgeScale = maximumEdge / Math.max(1, width, height);
+  const scale = Math.min(1, pixelScale, edgeScale);
+  const analysisWidth = Math.max(1, Math.floor(width * scale));
+  const analysisHeight = Math.max(1, Math.floor(height * scale));
+  return {
+    width: analysisWidth,
+    height: analysisHeight,
+    scaleX: analysisWidth / Math.max(1, width),
+    scaleY: analysisHeight / Math.max(1, height),
+  };
+}
+
 async function segmentCouponImage(source: ImportSource): Promise<CouponRegion[]> {
   const bitmap = await decodeCanonicalCouponImage(source.file).catch((error) => {
     throw withImportStage(error, 'decode', source.file.name);
   });
-  const canvas = document.createElement('canvas'); canvas.width = bitmap.width; canvas.height = bitmap.height;
+  const analysis = getSegmentationDimensions(bitmap.width, bitmap.height);
+  const canvas = document.createElement('canvas'); canvas.width = analysis.width; canvas.height = analysis.height;
   try {
     const context = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
     if (!context) throw new Error('Canvas er ikke tilgjengelig.');
-    context.fillStyle = '#fff'; context.fillRect(0, 0, canvas.width, canvas.height); context.drawImage(bitmap.source, 0, 0);
-    const boxes = detectCouponBoxes(context.getImageData(0, 0, canvas.width, canvas.height));
+    context.fillStyle = '#fff'; context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(bitmap.source, 0, 0, bitmap.width, bitmap.height, 0, 0, canvas.width, canvas.height);
+    const boxes = detectCouponBoxes(context.getImageData(0, 0, canvas.width, canvas.height)).map((box) => {
+      const x = Math.max(0, Math.round(box.x / analysis.scaleX));
+      const y = Math.max(0, Math.round(box.y / analysis.scaleY));
+      return {
+        x,
+        y,
+        width: Math.min(bitmap.width - x, Math.max(1, Math.round(box.width / analysis.scaleX))),
+        height: Math.min(bitmap.height - y, Math.max(1, Math.round(box.height / analysis.scaleY))),
+      };
+    });
     const regions: CouponRegion[] = [];
     for (let index = 0; index < boxes.length; index += 1) {
       const box = boxes[index];
@@ -1937,14 +2070,54 @@ function normalizeImportedDraft(item: ImportDraft) {
     kickoff: normalizedKickoff || clean(item.kickoff),
     competition: normalizeCompetitionValue(item.competition),
     coupon: normalizeCouponNumber(item.coupon),
+    market: normalizeNorwegianBetText(item.market, 'market'),
+    selection: normalizeNorwegianBetText(item.selection, 'selection'),
     odds: clean(item.odds),
     stake: clean(item.stake),
     payout: clean(item.payout),
   };
 }
 
+function stableImportHash(value: string) {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function identityPart(value: unknown) {
+  return clean(String(value ?? '')).toLocaleLowerCase('nb-NO');
+}
+
+function stableInternalCouponId(item: ImportDraft) {
+  const sourceIdentity = item.sourceId ? item.sourceId.split(':').slice(1).join(':') : '';
+  const identity = [
+    sourceIdentity,
+    item.regionOrder ?? '',
+    item.match,
+    item.kickoff,
+    item.competition,
+    item.stake,
+    item.payout,
+  ].map(identityPart).join('|');
+  return `intern:${stableImportHash(identity)}`;
+}
+
+export function importSelectionDedupKey(item: Pick<ImportDraft, 'coupon' | 'match' | 'kickoff' | 'competition' | 'market' | 'selection' | 'odds' | 'stake' | 'payout'>) {
+  const coupon = identityPart(item.coupon);
+  const fields = coupon
+    ? [coupon, item.match, item.market, item.selection]
+    : [item.match, item.kickoff, item.competition, item.market, item.selection, item.odds, item.stake, item.payout];
+  return fields.map(identityPart).join('|');
+}
+
 function reconcileImportedDrafts(items: ImportDraft[]) {
-  return items.map(normalizeImportedDraft);
+  return items.map((item) => {
+    const normalized = normalizeImportedDraft(item);
+    return { ...normalized, groupId: normalized.coupon || stableInternalCouponId(normalized) };
+  });
 }
 
 export function draftErrors(item: ImportDraft) {
@@ -1968,8 +2141,6 @@ export function draftErrors(item: ImportDraft) {
 
   if (!/^\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}$/.test(kickoff)) errors.push('Starttid må være på formatet DD.MM.YYYY HH:MM.');
   if (!competition || normalizedItem.competition.length > 100 || /Spillobjekt|Spilt\s+utfall|\bI\s*(?:dag|morgen)\b/i.test(competition)) errors.push('Turneringsnavnet må kontrolleres.');
-  if (!/^\d{6,12}(?:\.\d+)?$/.test(coupon)) errors.push('Kupongnummer mangler eller har ugyldig format.');
-
   const odds = numberFrom(normalizedItem.odds); const stake = numberFrom(normalizedItem.stake); const payout = numberFrom(normalizedItem.payout);
   if (!(odds > 1 && odds < 1000)) errors.push('Odds må være et tall mellom 1 og 1000.');
   if (!(stake > 0 && stake < 1_000_000)) errors.push('Innsats mangler eller er ugyldig.');
@@ -1977,6 +2148,13 @@ export function draftErrors(item: ImportDraft) {
   if (odds > 1 && market && new RegExp(`(?:^|\\s)${odds.toFixed(2).replace('.', '[.,]')}\\s*$`).test(market)) errors.push('Markedet ser ut til å inneholde spillvalgets odds.');
   if (odds > 1 && stake > 0 && payout > 0 && Math.abs((odds * stake) - payout) > Math.max(2, payout * .06)) errors.push('Innsats × odds stemmer ikke med mulig premie.');
   return [...new Set(errors)];
+}
+
+export function draftWarnings(item: ImportDraft) {
+  const coupon = clean(normalizeCouponNumber(item.coupon));
+  if (!coupon) return ['Kupongnummer mangler. Duplikatkontroll bruker kamp, tidspunkt, marked, spillvalg og beløp.'];
+  if (!/^\d{6,12}(?:\.\d+)?$/.test(coupon)) return ['Kupongnummeret har uventet format. Duplikatkontroll bruker også de øvrige kupongfeltene.'];
+  return [];
 }
 
 export function getImportReviewStatus(items: readonly ImportDraft[]) {
@@ -2006,9 +2184,12 @@ export interface CanonicalImportPipelineOptions {
   onProgress?: (progress: number) => void;
   onDetectedRegions?: (count: number) => void;
   onFileProgress?: (completed: number, total: number) => void;
+  onAnalysisProgress?: (current: number, total: number) => void;
+  onCouponProgress?: (current: number, total: number) => void;
   onSourceSettled?: (source: ImportSource, error?: unknown) => void;
   concurrency?: number;
   workerFactory?: typeof createWorker;
+  signal?: AbortSignal;
 }
 
 export interface CanonicalImportPipelineResult {
@@ -2020,6 +2201,7 @@ export interface CanonicalImportPipelineResult {
 interface ImportSourceQueueOptions {
   concurrency?: number;
   onSourceSettled?: (source: ImportSource, error?: unknown) => void;
+  signal?: AbortSignal;
 }
 
 export interface ImportSourceQueueResult<T> {
@@ -2039,12 +2221,14 @@ export async function processImportSourcesInOrder<T>(
   const concurrency = Math.max(1, Math.min(ordered.length || 1, Math.floor(options.concurrency || 1)));
   const workers = Array.from({ length: concurrency }, async () => {
     while (nextIndex < ordered.length) {
+      assertImportActive(options.signal);
       const index = nextIndex;
       nextIndex += 1;
       const source = ordered[index];
       try {
         completed[index] = { source, result: await processSource(source) };
       } catch (error) {
+        if (error instanceof ImportAbortError || options.signal?.aborted) throw new ImportAbortError();
         completed[index] = { source, error };
       } finally {
         options.onSourceSettled?.(source, completed[index]?.error);
@@ -2055,17 +2239,76 @@ export async function processImportSourcesInOrder<T>(
   return completed;
 }
 
-async function importCouponSource(
+interface TwoPhaseImportQueueOptions {
+  concurrency?: number;
+  signal?: AbortSignal;
+  onAnalysisProgress?: (current: number, total: number) => void;
+  onItemsIdentified?: (total: number) => void;
+  onCouponProgress?: (current: number, total: number) => void;
+}
+
+export async function runTwoPhaseImportQueue<TItem, TResult>(
+  sources: readonly ImportSource[],
+  analyzeSource: (source: ImportSource, signal?: AbortSignal) => Promise<readonly TItem[]>,
+  processSource: (
+    source: ImportSource,
+    items: readonly TItem[],
+    reportItemComplete: () => void,
+    signal?: AbortSignal,
+  ) => Promise<readonly TResult[]>,
+  options: TwoPhaseImportQueueOptions = {},
+) {
+  const ordered = [...sources].sort((a, b) => a.sourceOrder - b.sourceOrder);
+  assertImportActive(options.signal);
+  let analyzedCount = 0;
+  const analyzed = await processImportSourcesInOrder(ordered, (source) => analyzeSource(source, options.signal), {
+    concurrency: options.concurrency,
+    signal: options.signal,
+    onSourceSettled: () => {
+      analyzedCount += 1;
+      options.onAnalysisProgress?.(analyzedCount, ordered.length);
+    },
+  });
+  assertImportActive(options.signal);
+
+  const failures = analyzed.flatMap(({ source, error }) => error ? [{ source, error }] : []);
+  const successful = analyzed.filter((batch): batch is ImportSourceQueueResult<readonly TItem[]> & { result: readonly TItem[] } => Boolean(batch.result));
+  const totalItems = successful.reduce((sum, batch) => sum + batch.result.length, 0);
+  options.onItemsIdentified?.(totalItems);
+  let completedItems = 0;
+  const analyzedBySource = new Map(successful.map((batch) => [batch.source.sourceId, batch.result]));
+  const processed = await processImportSourcesInOrder(successful.map((batch) => batch.source), async (source) => {
+    const items = analyzedBySource.get(source.sourceId) || [];
+    return processSource(source, items, () => {
+      assertImportActive(options.signal);
+      completedItems += 1;
+      options.onCouponProgress?.(completedItems, totalItems);
+    }, options.signal);
+  }, {
+    concurrency: options.concurrency,
+    signal: options.signal,
+  });
+  assertImportActive(options.signal);
+  failures.push(...processed.flatMap(({ source, error }) => error ? [{ source, error }] : []));
+  return {
+    results: processed.flatMap(({ result }) => result ? [...result] : []),
+    totalItems,
+    failures,
+  };
+}
+
+type CouponOcrWorker = Awaited<ReturnType<typeof createWorker>>;
+
+interface ImportWorkerContext {
+  signal?: AbortSignal;
+  activeWorkers: Set<CouponOcrWorker>;
+}
+
+async function createImportWorker(
   source: ImportSource,
   workerFactory: typeof createWorker,
-  onProgress?: (progress: number) => void,
+  context: ImportWorkerContext,
 ) {
-  const initialRegions = (await segmentCouponImage(source))
-    .sort((a, b) => (a.sourceOrder - b.sourceOrder) || (a.regionOrder - b.regionOrder));
-  if (!initialRegions.length) throw new CouponImportError('segment', source.file.name, new Error('Ingen kupongområder ble funnet.'));
-
-  let activeRegionIndex = 0;
-  let progressTotal = initialRegions.length;
   let loadingStage: CouponImportStage = 'worker';
   const worker = await workerFactory('nor+eng', 1, {
     ...getTesseractAssetPaths(),
@@ -2073,25 +2316,50 @@ async function importCouponSource(
       if (message.status === 'loading tesseract core') loadingStage = 'core';
       else if (message.status === 'loading language traineddata') loadingStage = 'language';
       else if (message.status === 'initializing tesseract') loadingStage = 'initialize';
-      else if (message.status === 'recognizing text') {
-        loadingStage = 'recognize';
-        onProgress?.((activeRegionIndex + message.progress) / Math.max(1, progressTotal));
-      }
+      else if (message.status === 'recognizing text') loadingStage = 'recognize';
     },
   }).catch((error) => {
+    assertImportActive(context.signal);
     throw withImportStage(error, loadingStage, source.file.name);
   });
+  if (context.signal?.aborted) {
+    try { await worker.terminate(); } catch { /* already stopping */ }
+    throw new ImportAbortError();
+  }
+  context.activeWorkers.add(worker);
+  return worker;
+}
 
+async function terminateImportWorker(source: ImportSource, worker: CouponOcrWorker, context: ImportWorkerContext) {
+  context.activeWorkers.delete(worker);
+  try { await worker.terminate(); } catch (error) {
+    if (!context.signal?.aborted) {
+      console.warn('[coupon-import] OCR-worker kunne ikke avsluttes rent.', { sourceId: source.sourceId, sourceName: source.file.name, error });
+    }
+  }
+}
+
+async function analyzeCouponSource(
+  source: ImportSource,
+  workerFactory: typeof createWorker,
+  context: ImportWorkerContext,
+) {
+  assertImportActive(context.signal);
+  const initialRegions = (await segmentCouponImage(source))
+    .sort((a, b) => (a.sourceOrder - b.sourceOrder) || (a.regionOrder - b.regionOrder));
+  if (!initialRegions.length) throw new CouponImportError('segment', source.file.name, new Error('Ingen kupongområder ble funnet.'));
+  const worker = await createImportWorker(source, workerFactory, context);
   try {
     const finalRegions: CouponRegion[] = [];
-    const cachedRecognition = new Map<Blob, Awaited<ReturnType<typeof recognizeBestRegion>>>();
     for (let index = 0; index < initialRegions.length; index += 1) {
-      activeRegionIndex = index;
+      assertImportActive(context.signal);
       const region = initialRegions[index];
       const preliminary = await recognizeBestRegion(worker, region, true).catch((error) => {
+        assertImportActive(context.signal);
         throw withImportStage(error, 'recognize', source.file.name);
       });
       const split = await splitRegionByOcrAnchors(region, preliminary.data.blocks).catch((error) => {
+        assertImportActive(context.signal);
         throw withImportStage(error, 'segment', source.file.name);
       });
       if (split.length > 1) {
@@ -2101,21 +2369,35 @@ async function importCouponSource(
         }));
       } else {
         finalRegions.push(region);
-        cachedRecognition.set(region.blob, preliminary);
       }
     }
+    return finalRegions.sort((a, b) => (a.sourceOrder - b.sourceOrder) || (a.regionOrder - b.regionOrder));
+  } finally {
+    await terminateImportWorker(source, worker, context);
+  }
+}
 
-    finalRegions.sort((a, b) => (a.sourceOrder - b.sourceOrder) || (a.regionOrder - b.regionOrder));
-    progressTotal = finalRegions.length;
+async function recognizeCouponSource(
+  source: ImportSource,
+  finalRegions: readonly CouponRegion[],
+  reportCoupon: () => void,
+  workerFactory: typeof createWorker,
+  context: ImportWorkerContext,
+) {
+  assertImportActive(context.signal);
+  const worker = await createImportWorker(source, workerFactory, context);
+  try {
     const found: ImportDraft[] = [];
     for (let index = 0; index < finalRegions.length; index += 1) {
-      activeRegionIndex = index;
+      assertImportActive(context.signal);
       const region = finalRegions[index];
-      const recognition = cachedRecognition.get(region.blob) || await recognizeBestRegion(worker, region, true).catch((error) => {
+      const recognition = await recognizeBestRegion(worker, region, true).catch((error) => {
+        assertImportActive(context.signal);
         throw withImportStage(error, 'recognize', source.file.name);
       });
       const positioned = parsePositionedCoupon(recognition.data.blocks, region.sourceName, region.previewUrl);
       const texts = await recognizeRegionTexts(worker, region, recognition.data.text).catch((error) => {
+        assertImportActive(context.signal);
         throw withImportStage(error, 'recognize', source.file.name);
       });
       const textCandidates = parseCouponCandidates(texts, region.sourceName, region.previewUrl);
@@ -2127,13 +2409,11 @@ async function importCouponSource(
         sourceOrder: region.sourceOrder,
         regionOrder: region.regionOrder,
       })));
-      onProgress?.((index + 1) / Math.max(1, finalRegions.length));
+      reportCoupon();
     }
-    return { drafts: reconcileImportedDrafts(found), detectedRegions: finalRegions.length };
+    return reconcileImportedDrafts(found);
   } finally {
-    try { await worker.terminate(); } catch (error) {
-      console.warn('[coupon-import] OCR-worker kunne ikke avsluttes rent.', { sourceId: source.sourceId, sourceName: source.file.name, error });
-    }
+    await terminateImportWorker(source, worker, context);
   }
 }
 
@@ -2147,52 +2427,50 @@ export async function importCouponFiles(
 ): Promise<CanonicalImportPipelineResult> {
   const orderedSources = [...sources].sort((a, b) => a.sourceOrder - b.sourceOrder);
   const workerFactory = options.workerFactory || createWorker;
-  const sourceProgress = new Map<string, number>();
-  let completedCount = 0;
-  let detectedRegions = 0;
-  const updateOverallProgress = () => options.onProgress?.(
-    orderedSources.length
-      ? orderedSources.reduce((sum, source) => sum + (sourceProgress.get(source.sourceId) || 0), 0) / orderedSources.length
-      : 0,
-  );
-  const batches = await processImportSourcesInOrder(orderedSources, async (source) => importCouponSource(
-    source,
-    workerFactory,
-    (progress) => {
-      sourceProgress.set(source.sourceId, progress);
-      updateOverallProgress();
-    },
-  ), {
-    concurrency: options.concurrency,
-    onSourceSettled: (source, error) => {
-      sourceProgress.set(source.sourceId, 1);
-      completedCount += 1;
-      updateOverallProgress();
-      options.onFileProgress?.(completedCount, orderedSources.length);
+  const activeWorkers = new Set<CouponOcrWorker>();
+  const context: ImportWorkerContext = { signal: options.signal, activeWorkers };
+  const stopWorkers = () => activeWorkers.forEach((worker) => { void worker.terminate().catch(() => undefined); });
+  options.signal?.addEventListener('abort', stopWorkers, { once: true });
+  try {
+    const queue = await runTwoPhaseImportQueue(
+      orderedSources,
+      (source) => analyzeCouponSource(source, workerFactory, context),
+      (source, regions, reportCoupon) => recognizeCouponSource(source, regions, reportCoupon, workerFactory, context),
+      {
+        concurrency: options.concurrency,
+        signal: options.signal,
+        onAnalysisProgress: (current, total) => {
+          options.onAnalysisProgress?.(current, total);
+          options.onFileProgress?.(current, total);
+          options.onProgress?.(total ? (current / total) * .35 : 0);
+        },
+        onItemsIdentified: (total) => options.onDetectedRegions?.(total),
+        onCouponProgress: (current, total) => {
+          options.onCouponProgress?.(current, total);
+          options.onProgress?.(total ? .35 + ((current / total) * .65) : 1);
+        },
+      },
+    );
+    const failures = queue.failures.map(({ source, error }) => {
+      const importError = withImportStage(error, 'recognize', source.file.name);
+      const message = getImportFailureMessage(importError);
+      console.error('[coupon-import]', {
+        stage: importError.stage,
+        sourceId: source.sourceId,
+        sourceName: source.file.name,
+        message,
+        error: importError.cause || importError,
+      });
       options.onSourceSettled?.(source, error);
-    },
-  });
-
-  const failures = batches.flatMap(({ source, error }) => {
-    if (!error) return [];
-    const importError = withImportStage(error, 'recognize', source.file.name);
-    const message = getImportFailureMessage(importError);
-    console.error('[coupon-import]', {
-      stage: importError.stage,
-      sourceId: source.sourceId,
-      sourceName: source.file.name,
-      message,
-      error: importError.cause || importError,
+      return { sourceId: source.sourceId, sourceName: source.file.name, stage: importError.stage, message, error: importError };
     });
-    return [{ sourceId: source.sourceId, sourceName: source.file.name, stage: importError.stage, message, error: importError }];
-  });
-  const drafts = batches.flatMap(({ result }) => {
-    if (!result) return [];
-    detectedRegions += result.detectedRegions;
-    return result.drafts;
-  }).sort((a, b) => ((a.sourceOrder ?? 0) - (b.sourceOrder ?? 0)) || ((a.regionOrder ?? 0) - (b.regionOrder ?? 0)));
-  options.onDetectedRegions?.(detectedRegions);
-  return { drafts, detectedRegions, failures };
+    const drafts = queue.results.sort((a, b) => ((a.sourceOrder ?? 0) - (b.sourceOrder ?? 0)) || ((a.regionOrder ?? 0) - (b.regionOrder ?? 0)));
+    return { drafts, detectedRegions: queue.totalItems, failures };
+  } finally {
+    options.signal?.removeEventListener('abort', stopWorkers);
+    await Promise.all([...activeWorkers].map((worker) => worker.terminate().catch(() => undefined)));
+    activeWorkers.clear();
+  }
 }
 
 export interface ValidatedImportBatch {
@@ -2209,8 +2487,7 @@ export function validateImportForPersistence(items: readonly ImportDraft[]): Val
 
   const seenSelections = new Set<string>();
   const ready = normalized.filter((item) => {
-    if (!item.coupon) return true;
-    const identity = [clean(item.coupon), clean(item.match), clean(item.market), clean(item.selection)].join('|').toLowerCase();
+    const identity = importSelectionDedupKey(item);
     if (seenSelections.has(identity)) return false;
     seenSelections.add(identity);
     return true;
@@ -2365,14 +2642,17 @@ export function OddsenTracker() {
   const [importStep, setImportStep] = useState<ImportStep>('source');
   const [importText, setImportText] = useState('');
   const [uploadFiles, setUploadFiles] = useState<ImportSource[]>([]);
+  const uploadFilesRef = useRef<ImportSource[]>([]);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const pendingAdditionalImport = useRef<{ preserveDrafts: boolean } | null>(null);
   const nextSourceOrder = useRef(0);
+  const importAbortController = useRef<AbortController | null>(null);
+  const importRun = useRef(0);
+  const previewRecoveries = useRef(new Set<string>());
   const [drafts, setDrafts] = useState<ImportDraft[]>([]);
   const [ocrBusy, setOcrBusy] = useState(false);
   const [ocrProgress, setOcrProgress] = useState(0);
-  const [ocrFileProgress, setOcrFileProgress] = useState({ current: 0, total: 0 });
-  const [detectedRegions, setDetectedRegions] = useState(0);
+  const [importProgress, setImportProgress] = useState<ImportProgressState>({ phase: 'analysis', current: 0, total: 0 });
   const [importError, setImportError] = useState('');
   const [importWarning, setImportWarning] = useState('');
   const [importedCount, setImportedCount] = useState(0);
@@ -2512,16 +2792,28 @@ export function OddsenTracker() {
     setSettlingId(null);
   }
 
+  function updateUploadFiles(next: ImportSource[] | ((current: ImportSource[]) => ImportSource[])) {
+    const value = typeof next === 'function' ? next(uploadFilesRef.current) : next;
+    uploadFilesRef.current = value;
+    setUploadFiles(value);
+  }
+
+  function stopActiveImport() {
+    importRun.current += 1;
+    importAbortController.current?.abort();
+    importAbortController.current = null;
+    setOcrBusy(false);
+  }
+
   function resetImportSource() {
-    uploadFiles.forEach((item) => releaseImportSourcePreview(item));
-    setUploadFiles([]);
+    uploadFilesRef.current.forEach((item) => releaseImportSourcePreview(item));
+    updateUploadFiles([]);
     nextSourceOrder.current = 0;
     setImportText('');
     setImportError('');
     setImportWarning('');
     setOcrProgress(0);
-    setOcrFileProgress({ current: 0, total: 0 });
-    setDetectedRegions(0);
+    setImportProgress({ phase: 'analysis', current: 0, total: 0 });
   }
 
   function openImport(mode: ImportMode = 'image') {
@@ -2530,10 +2822,11 @@ export function OddsenTracker() {
     setImportStep('source');
     setAppendImport(false);
     setImportError('');
-    setDetectedRegions(0);
+    setImportProgress({ phase: 'analysis', current: 0, total: 0 });
   }
 
   function closeImport() {
+    stopActiveImport();
     pendingAdditionalImport.current = null;
     resetImportSource();
     setDrafts([]);
@@ -2542,6 +2835,7 @@ export function OddsenTracker() {
   }
 
   function returnToImportSource() {
+    stopActiveImport();
     resetImportSource();
     setAppendImport(false);
     setImportStep('source');
@@ -2561,7 +2855,7 @@ export function OddsenTracker() {
   }
 
   function addFiles(files: FileList | File[], replace = false) {
-    const selection = evaluateImportFileSelection([...files], replace ? 0 : uploadFiles.length);
+    const selection = evaluateImportFileSelection([...files], replace ? 0 : uploadFilesRef.current.length);
     if (selection.error) { setImportError(selection.error); return false; }
     let prepared: ImportSource[];
     try {
@@ -2572,14 +2866,43 @@ export function OddsenTracker() {
       return false;
     }
     if (replace) {
-      uploadFiles.forEach((item) => releaseImportSourcePreview(item));
+      uploadFilesRef.current.forEach((item) => releaseImportSourcePreview(item));
       nextSourceOrder.current = 0;
     }
     nextSourceOrder.current += prepared.length;
-    setUploadFiles((all) => replace ? prepared : [...all, ...prepared]);
+    updateUploadFiles((all) => replace ? prepared : [...all, ...prepared]);
     setImportError('');
     setImportWarning('');
     return true;
+  }
+
+  async function handlePreviewError(source: ImportSource) {
+    if (source.previewStatus === 'error' || source.previewStatus === 'recovering' || previewRecoveries.current.has(source.sourceId)) return;
+    if (source.previewStatus === 'ready') {
+      releaseImportSourcePreview(source);
+      updateUploadFiles((all) => all.map((item) => item.sourceId === source.sourceId
+        ? { ...item, url: '', previewStatus: 'error' }
+        : item));
+      setImportWarning(`${getImportFailureMessage({ stage: 'preview', sourceName: source.file.name })} OCR kan fortsatt fortsette fra originalfilen.`);
+      return;
+    }
+    previewRecoveries.current.add(source.sourceId);
+    const session = importRun.current;
+    updateUploadFiles((all) => all.map((item) => item.sourceId === source.sourceId ? { ...item, previewStatus: 'recovering' } : item));
+    try {
+      const recovered = await recoverImportSourcePreview(source);
+      const stillActive = session === importRun.current && uploadFilesRef.current.some((item) => item.sourceId === source.sourceId);
+      if (!stillActive) {
+        releaseImportSourcePreview(recovered);
+        return;
+      }
+      updateUploadFiles((all) => all.map((item) => item.sourceId === source.sourceId ? recovered : item));
+      if (recovered.previewStatus === 'error') {
+        setImportWarning(`${getImportFailureMessage({ stage: 'preview', sourceName: source.file.name })} OCR kan fortsatt fortsette fra originalfilen.`);
+      }
+    } finally {
+      previewRecoveries.current.delete(source.sourceId);
+    }
   }
 
   function handleImageSelection(event: ChangeEvent<HTMLInputElement>) {
@@ -2596,36 +2919,64 @@ export function OddsenTracker() {
     }
   }
 
+  function cancelImport() {
+    if (!ocrBusy) return;
+    stopActiveImport();
+    resetImportSource();
+    setImportWarning('Importen ble avbrutt. Midlertidige bilderessurser er ryddet.');
+    setImportStep('source');
+  }
+
   async function processSource() {
     if (importMode === 'text') {
       const parsed = parseCouponText(importText, 'Innlimt tekst');
       if (!parsed.length) return setImportError('Fant ingen komplette kuponger. Kontroller teksten eller velg «Registrer manuelt».');
       acceptImportedDrafts(parsed); return;
     }
-    if (!uploadFiles.length || ocrBusy) return setImportError('Legg til minst ett skjermbilde først.');
+    const sources = [...uploadFilesRef.current];
+    if (!sources.length || ocrBusy) return setImportError('Legg til minst ett skjermbilde først.');
+    const run = importRun.current + 1;
+    importRun.current = run;
+    const controller = new AbortController();
+    importAbortController.current = controller;
     setOcrBusy(true); setImportError(''); setImportWarning(''); setOcrProgress(0);
-    setOcrFileProgress({ current: 1, total: uploadFiles.length });
+    setImportProgress({ phase: 'analysis', current: 1, total: sources.length });
     try {
-      const result = await importCouponFiles(uploadFiles, {
-        onProgress: setOcrProgress,
-        onDetectedRegions: setDetectedRegions,
-        onFileProgress: (completed, total) => setOcrFileProgress({ current: Math.min(total, completed + 1), total }),
+      const result = await importCouponFiles(sources, {
+        signal: controller.signal,
+        onProgress: (progress) => { if (importRun.current === run) setOcrProgress(progress); },
+        onAnalysisProgress: (completed, total) => {
+          if (importRun.current === run) setImportProgress({ phase: 'analysis', current: Math.min(total, completed + 1), total });
+        },
+        onDetectedRegions: (total) => {
+          if (importRun.current === run) setImportProgress({ phase: 'coupon', current: total ? 1 : 0, total });
+        },
+        onCouponProgress: (current, total) => {
+          if (importRun.current === run) setImportProgress({ phase: 'coupon', current, total });
+        },
         concurrency: importOcrConcurrency,
       });
+      if (importRun.current !== run) return;
       if (result.failures.length) {
         setImportError(`${result.failures.map((failure) => failure.message).join(' ')} Bildene er beholdt; trykk «Les skjermbilder» for å prøve igjen.`);
         if (result.drafts.length) setImportWarning(`${result.drafts.length} spillvalg ble lest, men importen venter til alle valgte bilder er ferdigbehandlet.`);
         return;
       }
       if (!result.drafts.length) return setImportError('Ingen kuponger ble funnet. Bildene er beholdt, slik at du kan prøve igjen.');
-      uploadFiles.forEach((source) => releaseImportSourcePreview(source));
-      setUploadFiles([]);
+      sources.forEach((source) => releaseImportSourcePreview(source));
+      updateUploadFiles([]);
       acceptImportedDrafts(result.drafts);
     } catch (error) {
-      const failure = withImportStage(error, 'recognize', uploadFiles[0]?.file.name || 'bildet');
+      if (error instanceof ImportAbortError || controller.signal.aborted || importRun.current !== run) return;
+      const failure = withImportStage(error, 'recognize', sources[0]?.file.name || 'bildet');
       console.error('[coupon-import]', { stage: failure.stage, sourceName: failure.sourceName, error: failure.cause || failure });
       setImportError(`${getImportFailureMessage(failure)} Bildene er beholdt; trykk «Les skjermbilder» for å prøve igjen.`);
-    } finally { setOcrBusy(false); }
+    } finally {
+      if (importRun.current === run) {
+        importAbortController.current = null;
+        setOcrBusy(false);
+      }
+    }
   }
 
   function updateDraft(id: string, field: keyof ImportDraft, value: string) {
@@ -2637,8 +2988,23 @@ export function OddsenTracker() {
     setDrafts(normalizedDrafts);
     if (invalid.length) return setImportError(`${invalid.length} ${invalid.length === 1 ? 'kupong har' : 'kuponger har'} feil som må rettes før lagring.`);
     if (!valid.length) return setImportError('Ingen kuponger er klare for lagring.');
-    const knownCoupons = new Set(bets.map((bet) => bet.coupon).filter(Boolean));
-    const fresh = valid.filter((item) => !item.coupon || !knownCoupons.has(item.coupon));
+    const knownSelections = new Set(bets.map((bet) => importSelectionDedupKey({
+      coupon: bet.coupon,
+      match: bet.match,
+      kickoff: bet.kickoff,
+      competition: bet.competition,
+      market: bet.market,
+      selection: bet.selection,
+      odds: String(bet.odds),
+      stake: String(bet.stake),
+      payout: String(bet.payout),
+    })));
+    const fresh = valid.filter((item) => {
+      const identity = importSelectionDedupKey(item);
+      if (knownSelections.has(identity)) return false;
+      knownSelections.add(identity);
+      return true;
+    });
     setBets((all) => [...all, ...fresh.map((item) => {
       const odds = oddsFrom(item.odds); const stake = numberFrom(item.stake);
       return { id: crypto.randomUUID(), couponGroupId: item.groupId, match: clean(item.match), kickoff: clean(item.kickoff), competition: clean(item.competition), coupon: clean(item.coupon), category: item.category, market: clean(item.market), selection: clean(item.selection), odds, stake, payout: numberFrom(item.payout) || stake * odds };
@@ -2758,7 +3124,7 @@ export function OddsenTracker() {
                   </div>
                 </div>
                 <div className="bet-columns" aria-label={`Sorter spill for ${group.match}`}>
-                  <span className="sort-guide"><GripVertical size={16} strokeWidth={2.4} /><span>Dra for manuell rekkefølge</span></span>
+                  <span className="sort-guide"><GripVertical size={15} strokeWidth={2.4} /><span>Dra for å sortere</span></span>
                   <span className="bet-description-column">Marked og spillvalg</span>
                   {renderSortButton(group.match, 'odds', 'Odds')}
                   {renderSortButton(group.match, 'stake', 'Innsats')}
@@ -2859,7 +3225,23 @@ export function OddsenTracker() {
           <header className="import-header"><div><span className="section-kicker">{importStep === 'review' ? 'Kontroller før lagring' : importStep === 'success' ? 'Import fullført' : appendImport ? 'Utvid innlesningen' : 'Ny kupongimport'}</span><h2 id="import-title">{importStep === 'review' ? `${draftCouponCount} ${draftCouponCount === 1 ? 'kupong' : 'kuponger'} · ${drafts.length} spillvalg` : importStep === 'success' ? 'Kupongene er lagt til' : appendImport ? 'Importer flere kuponger' : 'Importer kupong'}</h2></div><button type="button" onClick={closeImport} aria-label="Lukk"><X /></button></header>
           {importStep === 'source' && <div className="import-body">
             <div className="import-tabs" role="tablist" aria-label="Velg importmetode"><button type="button" role="tab" aria-selected={importMode === 'image'} className={importMode === 'image' ? 'active' : ''} onClick={() => { setImportMode('image'); setImportError(''); }}><ImageIcon size={16} /> Skjermbilder</button><button type="button" role="tab" aria-selected={importMode === 'text'} className={importMode === 'text' ? 'active' : ''} onClick={() => { setImportMode('text'); setImportError(''); }}><FileText size={16} /> Kupongtekst</button></div>
-            {importMode === 'image' ? <><button type="button" className="dropzone" onClick={() => imageInputRef.current && openImportFilePicker(imageInputRef.current)} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles(event.dataTransfer.files); }}><Upload size={30} /><strong>{mobileImportEnvironment ? 'Velg eller ta skjermbilder' : 'Dra skjermbilder hit, eller klikk for å velge'}</strong><span>PNG, JPG eller WEBP · opptil {MAX_IMPORT_FILES} bilder</span></button>{uploadFiles.length > 0 && <p className="image-selection-count">{uploadFiles.length} av {MAX_IMPORT_FILES} bilder valgt</p>}{selectedFileWarning && <p className="import-warning"><CircleAlert size={16} />{selectedFileWarning}</p>}{uploadFiles.length > 0 && !ocrBusy && <div className="image-queue">{uploadFiles.map((item) => <figure key={item.sourceId}><img src={item.url} alt={item.file.name} onError={() => setImportError(getImportFailureMessage({ stage: 'preview', sourceName: item.file.name }))} /><figcaption title={item.file.name}>{item.file.name}</figcaption><button type="button" onClick={() => { releaseImportSourcePreview(item); setUploadFiles((all) => all.filter((file) => file.sourceId !== item.sourceId)); }} aria-label={`Fjern ${item.file.name}`}><X size={14} /></button></figure>)}</div>}{ocrBusy && <div className="ocr-progress"><div><Loader2 className="spin" size={17} /><span>Behandler bilde {ocrFileProgress.current} av {ocrFileProgress.total}{detectedRegions ? ` · ${detectedRegions} kupongområder funnet` : ''} · {Math.round(ocrProgress * 100)} %</span></div><i style={{ width: `${Math.round(ocrProgress * 100)}%` }} /></div>}</> : <label className="text-source">Kupongtekst<textarea value={importText} onChange={(event) => setImportText(event.target.value)} placeholder={'Lim inn én eller flere kvitteringer her…\n\nInnsats: 100,00\nOdds: 2.10\nMulig Premie: 210,00\n1. Norge v England\nStarttid: 11/7 23:00\nSpillobjekt: Scorer mål\nSpilt utfall: Erling Haaland'} /></label>}
+            {importMode === 'image' ? <>
+              <button type="button" className="dropzone" disabled={ocrBusy} onClick={() => imageInputRef.current && openImportFilePicker(imageInputRef.current)} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); if (!ocrBusy) addFiles(event.dataTransfer.files); }}><Upload size={30} /><strong>{mobileImportEnvironment ? 'Velg eller ta skjermbilder' : 'Dra skjermbilder hit, eller klikk for å velge'}</strong><span>PNG, JPG eller WEBP · opptil {MAX_IMPORT_FILES} bilder</span></button>
+              {uploadFiles.length > 0 && <p className="image-selection-count">{getImageSelectionLabel(uploadFiles.length)}</p>}
+              {selectedFileWarning && <p className="import-warning"><CircleAlert size={16} />{selectedFileWarning}</p>}
+              {uploadFiles.length > 0 && !ocrBusy && <div className="image-queue">{uploadFiles.map((item) => <figure key={item.sourceId}>
+                {item.url && item.previewStatus !== 'error' && item.previewStatus !== 'recovering'
+                  ? <img src={item.url} alt={item.file.name} onError={() => { void handlePreviewError(item); }} />
+                  : <div className="preview-placeholder"><ImageIcon size={22} /><span>{item.previewStatus === 'recovering' ? 'Lager forhåndsvisning' : 'Forhåndsvisning utilgjengelig'}</span></div>}
+                <figcaption title={item.file.name}>{item.file.name}</figcaption>
+                <button type="button" onClick={() => { releaseImportSourcePreview(item); updateUploadFiles((all) => all.filter((file) => file.sourceId !== item.sourceId)); }} aria-label={`Fjern ${item.file.name}`}><X size={14} /></button>
+              </figure>)}</div>}
+              {ocrBusy && <div className="ocr-progress">
+                <div><Loader2 className="spin" size={17} /><span>{importProgress.phase === 'analysis' ? `Analyserer bilde ${importProgress.current} av ${importProgress.total}` : `Behandler kupong ${importProgress.current} av ${importProgress.total}`} · {Math.round(ocrProgress * 100)} %</span></div>
+                <i style={{ width: `${Math.round(ocrProgress * 100)}%` }} />
+                <button type="button" className="cancel-import-button" onClick={cancelImport}><X size={15} /> Avbryt</button>
+              </div>}
+            </> : <label className="text-source">Kupongtekst<textarea value={importText} onChange={(event) => setImportText(event.target.value)} placeholder={'Lim inn én eller flere kvitteringer her…\n\nInnsats: 100,00\nOdds: 2.10\nMulig Premie: 210,00\n1. Norge v England\nStarttid: 11/7 23:00\nSpillobjekt: Scorer mål\nSpilt utfall: Erling Haaland'} /></label>}
             {importWarning && <p className="import-warning"><CircleAlert size={16} />{importWarning}</p>}
             {importError && <p className="import-error">{importError}</p>}
           </div>}
@@ -2867,11 +3249,13 @@ export function OddsenTracker() {
             <div className={`review-intro is-${reviewStatus.tone}`}>{reviewStatus.tone === 'error' ? <CircleAlert size={18} /> : <Check size={18} />}<p><strong>{reviewStatus.message}</strong></p></div>
             <div className="review-list">{drafts.map((item, index) => {
               const errors = draftErrors(item);
+              const warnings = draftWarnings(item);
               return <article className={`review-card ${errors.length ? 'is-invalid' : 'is-valid'}`} key={item.id}>
                 <div className="review-card-head"><strong>Spillvalg {index + 1}</strong><span>{item.sourceName || 'Manuelt registrert'}</span><em>{errors.length ? `${errors.length} feil` : 'Klar'}</em><button type="button" onClick={() => setDrafts((all) => all.filter((row) => row.id !== item.id))} aria-label={`Fjern spillvalg ${index + 1}`}><Trash2 size={15} /></button></div>
                 {item.sourcePreview && <img className="review-preview" src={item.sourcePreview} alt={`Bildeutdrag for spillvalg ${index + 1}`} />}
-                <div className="review-grid"><label className="wide">Kamp<input value={item.match} onChange={(event) => updateDraft(item.id, 'match', event.target.value)} placeholder="Norge vs England" /></label><label>Starttid<input value={item.kickoff} onChange={(event) => updateDraft(item.id, 'kickoff', event.target.value)} placeholder="DD.MM.YYYY HH:MM" /></label><label>Turnering<textarea rows={1} value={item.competition} onChange={(event) => updateDraft(item.id, 'competition', event.target.value)} /></label><label className="wide">Marked<input value={item.market} onChange={(event) => updateDraft(item.id, 'market', event.target.value)} /></label><label className="wide">Spillvalg<input value={item.selection} onChange={(event) => updateDraft(item.id, 'selection', event.target.value)} /></label><label>Odds<input inputMode="decimal" value={item.odds} onChange={(event) => updateDraft(item.id, 'odds', event.target.value)} /></label><label>Innsats<input inputMode="decimal" value={item.stake} onChange={(event) => updateDraft(item.id, 'stake', event.target.value)} /></label><label>Mulig premie<input inputMode="decimal" value={item.payout} onChange={(event) => updateDraft(item.id, 'payout', event.target.value)} /></label><label>Kategori<select value={item.category} onChange={(event) => updateDraft(item.id, 'category', event.target.value)}>{CATEGORIES.slice(1).map((category) => <option key={category}>{category}</option>)}</select></label><label className="wide">Kupongnummer<input value={item.coupon} onChange={(event) => updateDraft(item.id, 'coupon', event.target.value)} /></label></div>
+                <div className="review-grid"><label className="wide">Kamp<input value={item.match} onChange={(event) => updateDraft(item.id, 'match', event.target.value)} placeholder="Norge vs England" /></label><label>Starttid<input value={item.kickoff} onChange={(event) => updateDraft(item.id, 'kickoff', event.target.value)} placeholder="DD.MM.YYYY HH:MM" /></label><label>Turnering<textarea rows={1} value={item.competition} onChange={(event) => updateDraft(item.id, 'competition', event.target.value)} /></label><label className="wide">Marked<input value={item.market} onChange={(event) => updateDraft(item.id, 'market', event.target.value)} /></label><label className="wide">Spillvalg<input value={item.selection} onChange={(event) => updateDraft(item.id, 'selection', event.target.value)} /></label><label>Odds<input inputMode="decimal" value={item.odds} onChange={(event) => updateDraft(item.id, 'odds', event.target.value)} /></label><label>Innsats<input inputMode="decimal" value={item.stake} onChange={(event) => updateDraft(item.id, 'stake', event.target.value)} /></label><label>Mulig premie<input inputMode="decimal" value={item.payout} onChange={(event) => updateDraft(item.id, 'payout', event.target.value)} /></label><label>Kategori<select value={item.category} onChange={(event) => updateDraft(item.id, 'category', event.target.value)}>{CATEGORIES.slice(1).map((category) => <option key={category}>{category}</option>)}</select></label><label className="wide">Kupongnummer (valgfritt)<input value={item.coupon} onChange={(event) => updateDraft(item.id, 'coupon', event.target.value)} /></label></div>
                 {errors.length > 0 && <ul className="review-errors">{errors.map((error) => <li key={error}>{error}</li>)}</ul>}
+                {warnings.length > 0 && <ul className="review-warnings">{warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>}
               </article>;
             })}</div>
             {importWarning && <p className="import-warning"><CircleAlert size={16} />{importWarning}</p>}
