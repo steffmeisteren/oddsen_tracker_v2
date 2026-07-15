@@ -6,6 +6,7 @@ import {
   Sun, Trash2, Trophy, Upload, X,
 } from 'lucide-react';
 import { createWorker } from 'tesseract.js';
+import { decode as decodeJpeg } from 'jpeg-js';
 import heroImage from '../../assets/world-cup-stadium-hero.png';
 import { resolveWorldCupTeam } from './worldCupTeams';
 import './oddsen-tracker.css';
@@ -53,10 +54,15 @@ export interface ImportDraft {
 
 export interface ImportSource {
   file: File;
+  blob: Blob;
   url: string;
   sourceId: string;
   sourceOrder: number;
   previewStatus: 'raw' | 'recovering' | 'ready' | 'error';
+  previewFailure?: 'preview' | 'decode';
+  decodeError?: CouponImportError;
+  detectedMimeType: SupportedImportImageMimeType;
+  magicBytes: string;
 }
 
 export type BetSortKey = 'odds' | 'stake' | 'payout';
@@ -101,6 +107,50 @@ export class CouponImportError extends Error {
   }
 }
 
+export type SupportedImportImageMimeType = 'image/jpeg' | 'image/png' | 'image/webp';
+
+export interface NormalizedImportImage {
+  originalFile: File;
+  blob: Blob;
+  detectedMimeType: SupportedImportImageMimeType;
+  magicBytes: string;
+  metadata: { name: string; type: string; size: number; lastModified: number };
+}
+
+export function detectImageMimeType(bytes: Uint8Array): SupportedImportImageMimeType | null {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+  if (bytes.length >= 8
+    && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47
+    && bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) return 'image/png';
+  if (bytes.length >= 12
+    && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46
+    && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return 'image/webp';
+  return null;
+}
+
+function describeMagicBytes(bytes: Uint8Array) {
+  return [...bytes.slice(0, 16)].map((value) => value.toString(16).padStart(2, '0').toUpperCase()).join(' ');
+}
+
+export async function normalizeImportImageFile(file: File): Promise<NormalizedImportImage> {
+  const buffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  const detectedMimeType = detectImageMimeType(bytes);
+  const magicBytes = describeMagicBytes(bytes);
+  if (!detectedMimeType) {
+    throw new CouponImportError('decode', file.name, new Error(`Ukjent bildesignatur (${magicBytes || 'tom fil'}).`));
+  }
+  const declaredType = file.type.toLowerCase();
+  const blob = declaredType === detectedMimeType ? file : new Blob([buffer], { type: detectedMimeType });
+  return {
+    originalFile: file,
+    blob,
+    detectedMimeType,
+    magicBytes,
+    metadata: { name: file.name, type: file.type, size: file.size, lastModified: file.lastModified },
+  };
+}
+
 export class ImportAbortError extends Error {
   constructor() {
     super('Importen ble avbrutt.');
@@ -112,11 +162,16 @@ function assertImportActive(signal?: AbortSignal): asserts signal is AbortSignal
   if (signal?.aborted) throw new ImportAbortError();
 }
 
-export function getImportFailureMessage(failure: Pick<CouponImportError, 'stage' | 'sourceName'>) {
+export function getImportFailureMessage(failure: Pick<CouponImportError, 'stage' | 'sourceName'> & Partial<Pick<CouponImportError, 'cause'>>) {
   const name = failure.sourceName || 'Bildet';
   switch (failure.stage) {
     case 'preview': return `Forhåndsvisningen av ${name} kunne ikke åpnes. Filen er beholdt.`;
-    case 'decode': return `${name} kunne ikke dekodes som PNG, JPG eller WEBP.`;
+    case 'decode': {
+      const detail = failure.cause instanceof CouponImageDecodeError
+        ? failure.cause.attempts.at(-1)?.error
+        : failure.cause instanceof Error ? failure.cause.message : '';
+      return `${name} kunne ikke dekodes som PNG, JPG eller WEBP.${detail ? ` Siste dekoderfeil: ${detail}` : ''}`;
+    }
     case 'segment': return `Kupongområdene i ${name} kunne ikke deles opp. Prøv igjen.`;
     case 'worker': return `OCR-motoren kunne ikke startes for ${name}. Prøv igjen.`;
     case 'core': return `OCR-kjernen kunne ikke lastes for ${name}. Prøv igjen.`;
@@ -146,6 +201,35 @@ export const LARGE_IMPORT_WARNING = 'Mange bilder kan føre til lengre behandlin
 
 export function getImageSelectionLabel(count: number) {
   return `${count} ${count === 1 ? 'bilde' : 'bilder'} valgt`;
+}
+
+interface ImportProgressIndicatorProps extends ImportProgressState {
+  progress: number;
+  onCancel: () => void;
+}
+
+export function ImportProgressIndicator({ phase, current, total, progress, onCancel }: ImportProgressIndicatorProps) {
+  const percent = Math.max(0, Math.min(100, Math.round(progress * 100)));
+  const message = `${phase === 'analysis' ? `Analyserer bilde ${current} av ${total}` : `Behandler kupong ${current} av ${total}`} · ${percent} %`;
+  return (
+    <div className="ocr-progress">
+      <div className="ocr-progress-status" aria-live="polite" aria-atomic="true">
+        <Loader2 className="spin" size={17} aria-hidden="true" />
+        <span>{message}</span>
+      </div>
+      <div
+        className="ocr-progress-track"
+        role="progressbar"
+        aria-label={message}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent}
+      >
+        <i style={{ width: `${percent}%` }} />
+      </div>
+      <button type="button" className="cancel-import-button" onClick={onCancel}><X size={15} /> Avbryt</button>
+    </div>
+  );
 }
 
 interface ImportNavigatorLike {
@@ -188,25 +272,39 @@ export function releaseImportSourcePreview(
   if (source.url.startsWith('blob:')) revoke(source.url);
 }
 
-export function createCanonicalImportSources(
+export async function createCanonicalImportSources(
   files: readonly File[],
   startOrder = 0,
-  createPreviewUrl: (file: File) => string = (file) => URL.createObjectURL(file),
-): ImportSource[] {
-  return files.map((file, index) => {
-    const sourceOrder = startOrder + index;
-    try {
-      return {
+  createPreviewUrl: (blob: Blob, file: File) => string = (blob) => URL.createObjectURL(blob),
+): Promise<ImportSource[]> {
+  const prepared: ImportSource[] = [];
+  try {
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      const sourceOrder = startOrder + index;
+      const normalized = await normalizeImportImageFile(file);
+      let url: string;
+      try {
+        url = createPreviewUrl(normalized.blob, file);
+      } catch (error) {
+        throw new CouponImportError('preview', file.name, error);
+      }
+      prepared.push({
         file,
-        url: createPreviewUrl(file),
+        blob: normalized.blob,
+        url,
         sourceOrder,
         sourceId: `${sourceOrder}:${file.name}:${file.size}:${file.lastModified}`,
         previewStatus: 'raw',
-      };
-    } catch (error) {
-      throw new CouponImportError('preview', file.name, error);
+        detectedMimeType: normalized.detectedMimeType,
+        magicBytes: normalized.magicBytes,
+      });
     }
-  });
+    return prepared;
+  } catch (error) {
+    prepared.forEach((source) => releaseImportSourcePreview(source));
+    throw error;
+  }
 }
 
 const CATEGORIES: Array<'Alle' | Category> = ['Alle', 'Kamp', 'Spiller', 'Timing', 'Resultat', 'Statistikk', 'Spesial'];
@@ -945,6 +1043,87 @@ interface DecodedCouponImage {
   width: number;
   height: number;
   close: () => void;
+  method?: CouponImageDecodeMethod;
+}
+
+export type CouponImageDecodeMethod =
+  | 'createImageBitmap med orientering'
+  | 'createImageBitmap uten options'
+  | 'object URL + bildeelement'
+  | 'data URL + bildeelement'
+  | 'lokal JPEG-dekoder';
+
+export interface CouponImageDecodeAttempt {
+  method: CouponImageDecodeMethod;
+  error: string;
+}
+
+interface CouponImageDecodeContext {
+  name: string;
+  declaredType: string;
+  size: number;
+  detectedMimeType: SupportedImportImageMimeType;
+  magicBytes: string;
+}
+
+export class CouponImageDecodeError extends Error {
+  readonly attempts: CouponImageDecodeAttempt[];
+  readonly context?: CouponImageDecodeContext;
+
+  constructor(attempts: CouponImageDecodeAttempt[], context?: CouponImageDecodeContext) {
+    const last = attempts.at(-1);
+    super(last ? `Ingen bildedekoder lyktes. ${last.method}: ${last.error}` : 'Ingen bildedekoder lyktes.');
+    this.name = 'CouponImageDecodeError';
+    this.attempts = attempts;
+    this.context = context;
+  }
+}
+
+function describeDecodeError(error: unknown) {
+  if (error instanceof Error) return `${error.name || 'Error'}: ${error.message}`;
+  return String(error || 'Ukjent dekodingsfeil');
+}
+
+function decodedImage(
+  source: CanvasImageSource,
+  width: number,
+  height: number,
+  close: () => void,
+  method: CouponImageDecodeMethod,
+  context?: CouponImageDecodeContext,
+  attempts: CouponImageDecodeAttempt[] = [],
+): DecodedCouponImage {
+  if (context) console.info('[coupon-image-decode]', { ...context, method, width, height, failedAttempts: attempts });
+  return { source, width, height, close, method };
+}
+
+async function decodeJpegLocally(
+  blob: Blob,
+  context: CouponImageDecodeContext | undefined,
+  attempts: CouponImageDecodeAttempt[],
+) {
+  const decoded = decodeJpeg(new Uint8Array(await blob.arrayBuffer()), {
+    useTArray: true,
+    formatAsRGBA: true,
+    tolerantDecoding: true,
+    maxResolutionInMP: 32,
+    maxMemoryUsageInMB: 192,
+  });
+  if (!(decoded.width > 0 && decoded.height > 0)) throw new Error('JPEG-dekoderen ga ingen gyldige pikselmål.');
+  const canvas = document.createElement('canvas');
+  canvas.width = decoded.width;
+  canvas.height = decoded.height;
+  try {
+    const drawing = canvas.getContext('2d', { alpha: false });
+    if (!drawing) throw new Error('Canvas er ikke tilgjengelig for JPEG-fallback.');
+    const pixels = drawing.createImageData(decoded.width, decoded.height);
+    pixels.data.set(decoded.data);
+    drawing.putImageData(pixels, 0, 0);
+    return decodedImage(canvas, decoded.width, decoded.height, () => releaseCanvas(canvas), 'lokal JPEG-dekoder', context, attempts);
+  } catch (error) {
+    releaseCanvas(canvas);
+    throw error;
+  }
 }
 
 async function decodeImageElement(sourceUrl: string, releaseSource: () => void): Promise<DecodedCouponImage> {
@@ -994,17 +1173,20 @@ async function blobAsDataUrl(blob: Blob) {
  * intrinsic decoded pixels are the only geometry source; viewport size, CSS
  * size and devicePixelRatio must never affect OCR input.
  */
-export async function decodeCanonicalCouponImage(blob: Blob): Promise<DecodedCouponImage> {
+export async function decodeCanonicalCouponImage(blob: Blob, context?: CouponImageDecodeContext): Promise<DecodedCouponImage> {
+  const attempts: CouponImageDecodeAttempt[] = [];
   if (typeof createImageBitmap === 'function') {
     try {
       const bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image' });
-      return { source: bitmap, width: bitmap.width, height: bitmap.height, close: () => bitmap.close() };
-    } catch {
+      return decodedImage(bitmap, bitmap.width, bitmap.height, () => bitmap.close(), 'createImageBitmap med orientering', context, attempts);
+    } catch (error) {
+      attempts.push({ method: 'createImageBitmap med orientering', error: describeDecodeError(error) });
       // Some mobile WebViews expose createImageBitmap but reject its options.
       try {
         const bitmap = await createImageBitmap(blob);
-        return { source: bitmap, width: bitmap.width, height: bitmap.height, close: () => bitmap.close() };
-      } catch {
+        return decodedImage(bitmap, bitmap.width, bitmap.height, () => bitmap.close(), 'createImageBitmap uten options', context, attempts);
+      } catch (fallbackError) {
+        attempts.push({ method: 'createImageBitmap uten options', error: describeDecodeError(fallbackError) });
         // Samsung Internet can expose createImageBitmap while rejecting JPEGs
         // that an ordinary image element can still decode.
       }
@@ -1013,19 +1195,42 @@ export async function decodeCanonicalCouponImage(blob: Blob): Promise<DecodedCou
 
   const url = URL.createObjectURL(blob);
   try {
-    return await decodeImageElement(url, () => URL.revokeObjectURL(url));
+    const decoded = await decodeImageElement(url, () => URL.revokeObjectURL(url));
+    return decodedImage(decoded.source, decoded.width, decoded.height, decoded.close, 'object URL + bildeelement', context, attempts);
   } catch (objectUrlError) {
+    attempts.push({ method: 'object URL + bildeelement', error: describeDecodeError(objectUrlError) });
     try {
       const dataUrl = await blobAsDataUrl(blob);
-      return await decodeImageElement(dataUrl, () => undefined);
+      const decoded = await decodeImageElement(dataUrl, () => undefined);
+      return decodedImage(decoded.source, decoded.width, decoded.height, decoded.close, 'data URL + bildeelement', context, attempts);
     } catch (dataUrlError) {
-      throw dataUrlError || objectUrlError;
+      attempts.push({ method: 'data URL + bildeelement', error: describeDecodeError(dataUrlError) });
+      if (blob.type === 'image/jpeg') {
+        try {
+          return await decodeJpegLocally(blob, context, attempts);
+        } catch (jpegError) {
+          attempts.push({ method: 'lokal JPEG-dekoder', error: describeDecodeError(jpegError) });
+        }
+      }
+      const failure = new CouponImageDecodeError(attempts, context);
+      if (context) console.error('[coupon-image-decode]', { ...context, attempts });
+      throw failure;
     }
   }
 }
 
-async function createImportThumbnailUrl(file: File) {
-  const decoded = await decodeCanonicalCouponImage(file);
+function sourceDecodeContext(source: ImportSource): CouponImageDecodeContext {
+  return {
+    name: source.file.name,
+    declaredType: source.file.type,
+    size: source.file.size,
+    detectedMimeType: source.detectedMimeType,
+    magicBytes: source.magicBytes,
+  };
+}
+
+async function createImportThumbnailUrl(source: ImportSource) {
+  const decoded = await decodeCanonicalCouponImage(source.blob, sourceDecodeContext(source));
   const maximumDimension = 640;
   const scale = Math.min(1, maximumDimension / Math.max(decoded.width, decoded.height));
   const canvas = document.createElement('canvas');
@@ -1046,16 +1251,25 @@ async function createImportThumbnailUrl(file: File) {
 
 export async function recoverImportSourcePreview(
   source: ImportSource,
-  createPreviewUrl: (file: File) => Promise<string> = createImportThumbnailUrl,
+  createPreviewUrl: (source: ImportSource) => Promise<string> = createImportThumbnailUrl,
   revoke: (url: string) => void = (url) => URL.revokeObjectURL(url),
 ): Promise<ImportSource> {
   try {
-    const url = await createPreviewUrl(source.file);
+    const url = await createPreviewUrl(source);
     releaseImportSourcePreview(source, revoke);
-    return { ...source, url, previewStatus: 'ready' };
-  } catch {
+    return { ...source, url, previewStatus: 'ready', previewFailure: undefined, decodeError: undefined };
+  } catch (error) {
     releaseImportSourcePreview(source, revoke);
-    return { ...source, url: '', previewStatus: 'error' };
+    const decodeError = error instanceof CouponImportError && error.stage === 'decode'
+      ? error
+      : error instanceof CouponImageDecodeError ? new CouponImportError('decode', source.file.name, error) : undefined;
+    return {
+      ...source,
+      url: '',
+      previewStatus: 'error',
+      previewFailure: decodeError ? 'decode' : 'preview',
+      decodeError,
+    };
   }
 }
 
@@ -1249,7 +1463,7 @@ export function getSegmentationDimensions(width: number, height: number) {
 }
 
 async function segmentCouponImage(source: ImportSource): Promise<CouponRegion[]> {
-  const bitmap = await decodeCanonicalCouponImage(source.file).catch((error) => {
+  const bitmap = await decodeCanonicalCouponImage(source.blob, sourceDecodeContext(source)).catch((error) => {
     throw withImportStage(error, 'decode', source.file.name);
   });
   const analysis = getSegmentationDimensions(bitmap.width, bitmap.height);
@@ -2854,15 +3068,17 @@ export function OddsenTracker() {
     setImportError('');
   }
 
-  function addFiles(files: FileList | File[], replace = false) {
+  async function addFiles(files: FileList | File[], replace = false) {
     const selection = evaluateImportFileSelection([...files], replace ? 0 : uploadFilesRef.current.length);
     if (selection.error) { setImportError(selection.error); return false; }
     let prepared: ImportSource[];
     try {
-      prepared = createCanonicalImportSources(selection.accepted, replace ? 0 : nextSourceOrder.current);
+      prepared = await createCanonicalImportSources(selection.accepted, replace ? 0 : nextSourceOrder.current);
     } catch (error) {
-      const previewError = withImportStage(error, 'preview', selection.accepted[0]?.name || 'bildet');
-      setImportError(getImportFailureMessage(previewError));
+      const importError = error instanceof CouponImportError
+        ? error
+        : withImportStage(error, 'decode', selection.accepted[0]?.name || 'bildet');
+      setImportError(`${getImportFailureMessage(importError)} Filen ble ikke lagt til.`);
       return false;
     }
     if (replace) {
@@ -2883,7 +3099,7 @@ export function OddsenTracker() {
       updateUploadFiles((all) => all.map((item) => item.sourceId === source.sourceId
         ? { ...item, url: '', previewStatus: 'error' }
         : item));
-      setImportWarning(`${getImportFailureMessage({ stage: 'preview', sourceName: source.file.name })} OCR kan fortsatt fortsette fra originalfilen.`);
+      setImportWarning(`${getImportFailureMessage({ stage: 'preview', sourceName: source.file.name })} Den validerte bildekilden er beholdt, og OCR kan fortsatt brukes.`);
       return;
     }
     previewRecoveries.current.add(source.sourceId);
@@ -2897,20 +3113,23 @@ export function OddsenTracker() {
         return;
       }
       updateUploadFiles((all) => all.map((item) => item.sourceId === source.sourceId ? recovered : item));
-      if (recovered.previewStatus === 'error') {
-        setImportWarning(`${getImportFailureMessage({ stage: 'preview', sourceName: source.file.name })} OCR kan fortsatt fortsette fra originalfilen.`);
+      if (recovered.previewFailure === 'decode' && recovered.decodeError) {
+        setImportWarning('');
+        setImportError(`${getImportFailureMessage(recovered.decodeError)} Filen er beholdt; trykk «Les skjermbilder» for å prøve igjen.`);
+      } else if (recovered.previewStatus === 'error') {
+        setImportWarning(`${getImportFailureMessage({ stage: 'preview', sourceName: source.file.name })} Den validerte bildekilden er beholdt, og OCR kan fortsatt brukes.`);
       }
     } finally {
       previewRecoveries.current.delete(source.sourceId);
     }
   }
 
-  function handleImageSelection(event: ChangeEvent<HTMLInputElement>) {
+  async function handleImageSelection(event: ChangeEvent<HTMLInputElement>) {
     const files = readImportFileSelection(event.currentTarget);
     const additional = pendingAdditionalImport.current;
     pendingAdditionalImport.current = null;
     if (!files.length) return;
-    if (!addFiles(files, Boolean(additional))) return;
+    if (!(await addFiles(files, Boolean(additional)))) return;
     if (additional) {
       if (!additional.preserveDrafts) setDrafts([]);
       setAppendImport(additional.preserveDrafts);
@@ -3236,11 +3455,7 @@ export function OddsenTracker() {
                 <figcaption title={item.file.name}>{item.file.name}</figcaption>
                 <button type="button" onClick={() => { releaseImportSourcePreview(item); updateUploadFiles((all) => all.filter((file) => file.sourceId !== item.sourceId)); }} aria-label={`Fjern ${item.file.name}`}><X size={14} /></button>
               </figure>)}</div>}
-              {ocrBusy && <div className="ocr-progress">
-                <div><Loader2 className="spin" size={17} /><span>{importProgress.phase === 'analysis' ? `Analyserer bilde ${importProgress.current} av ${importProgress.total}` : `Behandler kupong ${importProgress.current} av ${importProgress.total}`} · {Math.round(ocrProgress * 100)} %</span></div>
-                <i style={{ width: `${Math.round(ocrProgress * 100)}%` }} />
-                <button type="button" className="cancel-import-button" onClick={cancelImport}><X size={15} /> Avbryt</button>
-              </div>}
+              {ocrBusy && <ImportProgressIndicator {...importProgress} progress={ocrProgress} onCancel={cancelImport} />}
             </> : <label className="text-source">Kupongtekst<textarea value={importText} onChange={(event) => setImportText(event.target.value)} placeholder={'Lim inn én eller flere kvitteringer her…\n\nInnsats: 100,00\nOdds: 2.10\nMulig Premie: 210,00\n1. Norge v England\nStarttid: 11/7 23:00\nSpillobjekt: Scorer mål\nSpilt utfall: Erling Haaland'} /></label>}
             {importWarning && <p className="import-warning"><CircleAlert size={16} />{importWarning}</p>}
             {importError && <p className="import-error">{importError}</p>}

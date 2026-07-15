@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import {
+  CouponImportError,
+  CouponImageDecodeError,
   createCanonicalImportSources,
   decodeCanonicalCouponImage,
+  detectImageMimeType,
   detectCouponBoxes,
   detectOcrGridBoxes,
   draftErrors,
@@ -14,10 +19,12 @@ import {
   getImportReviewStatus,
   getTesseractAssetPaths,
   ImportAbortError,
+  ImportProgressIndicator,
   materializeMatchSort,
   mergePositionedWithText,
   nextBetSort,
   normalizeNorwegianBetText,
+  normalizeImportImageFile,
   openImportFilePicker,
   parseCouponText,
   parsePositionedCoupon,
@@ -37,6 +44,43 @@ afterEach(() => {
 });
 
 describe('kupongimport', () => {
+  it.each(['', 'application/octet-stream', 'image/jpg', 'image/jpeg'])(
+    'normaliserer JPEG fra magic bytes når filvelgeren oppgir MIME «%s»',
+    async (declaredType) => {
+      const bytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
+      const original = new File([bytes], '3158.jpg', { type: declaredType, lastModified: 123 });
+
+      const normalized = await normalizeImportImageFile(original);
+
+      expect(normalized.originalFile).toBe(original);
+      expect(normalized.blob.type).toBe('image/jpeg');
+      expect(normalized.detectedMimeType).toBe('image/jpeg');
+      expect(normalized.magicBytes).toBe('FF D8 FF E0 00 10 4A 46 49 46');
+      expect(normalized.metadata).toEqual({ name: '3158.jpg', type: declaredType, size: 10, lastModified: 123 });
+    },
+  );
+
+  it('identifiserer JPEG, PNG og WEBP fra magic bytes og avviser ukjent data', () => {
+    expect(detectImageMimeType(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]))).toBe('image/jpeg');
+    expect(detectImageMimeType(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))).toBe('image/png');
+    expect(detectImageMimeType(new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50]))).toBe('image/webp');
+    expect(detectImageMimeType(new Uint8Array([0x00, 0x01, 0x02, 0x03]))).toBeNull();
+  });
+
+  it('renderer status over en semantisk progressbar', () => {
+    const markup = renderToStaticMarkup(createElement(ImportProgressIndicator, {
+      phase: 'coupon', current: 6, total: 10, progress: 0.74, onCancel: vi.fn(),
+    }));
+
+    expect(markup).toContain('aria-live="polite"');
+    expect(markup).toContain('Behandler kupong 6 av 10 · 74 %');
+    expect(markup).toContain('role="progressbar"');
+    expect(markup).toContain('aria-valuemin="0"');
+    expect(markup).toContain('aria-valuemax="100"');
+    expect(markup).toContain('aria-valuenow="74"');
+    expect(markup.indexOf('Behandler kupong 6 av 10')).toBeLessThan(markup.indexOf('role="progressbar"'));
+  });
+
   it.each([
     ['Scorer begge lagi 1 omgang?', 'market', 'Scorer begge lag i 1. omgang?'],
     ['Scorer begge lag i 2 omgang?', 'market', 'Scorer begge lag i 2. omgang?'],
@@ -570,22 +614,26 @@ Kupongnummer: 301646585.1`);
     expect(result.ready).toEqual([]);
   });
 
-  it('gir filvelger og drag-and-drop samme deterministiske kildeidentitet', () => {
+  it('gir filvelger og drag-and-drop samme deterministiske kildeidentitet og normaliserte blob', async () => {
     const files = [
-      new File([new Uint8Array([1])], '3135.jpg', { type: 'image/jpeg', lastModified: 1_720_950_000_000 }),
-      new File([new Uint8Array([2, 3])], '3132.jpg', { type: 'image/jpeg', lastModified: 1_720_950_001_000 }),
+      new File([new Uint8Array([0xff, 0xd8, 0xff])], '3135.jpg', { type: '', lastModified: 1_720_950_000_000 }),
+      new File([new Uint8Array([0xff, 0xd8, 0xff, 0xe0])], '3132.jpg', { type: 'application/octet-stream', lastModified: 1_720_950_001_000 }),
     ];
-    const preview = (file: File) => `fixture://${file.name}`;
+    const previewBlobs: Blob[] = [];
+    const preview = (blob: Blob, file: File) => { previewBlobs.push(blob); return `fixture://${file.name}`; };
 
-    const fromFilePicker = createCanonicalImportSources(files, 4, preview);
-    const fromDrop = createCanonicalImportSources(Array.from(files), 4, preview);
+    const fromFilePicker = await createCanonicalImportSources(files, 4, preview);
+    const fromDrop = await createCanonicalImportSources(Array.from(files), 4, preview);
 
     expect(fromFilePicker.map(({ sourceId, sourceOrder, url }) => ({ sourceId, sourceOrder, url }))).toEqual([
-      { sourceId: '4:3135.jpg:1:1720950000000', sourceOrder: 4, url: 'fixture://3135.jpg' },
-      { sourceId: '5:3132.jpg:2:1720950001000', sourceOrder: 5, url: 'fixture://3132.jpg' },
+      { sourceId: '4:3135.jpg:3:1720950000000', sourceOrder: 4, url: 'fixture://3135.jpg' },
+      { sourceId: '5:3132.jpg:4:1720950001000', sourceOrder: 5, url: 'fixture://3132.jpg' },
     ]);
     expect(fromDrop.map(({ sourceId, sourceOrder, url }) => ({ sourceId, sourceOrder, url })))
       .toEqual(fromFilePicker.map(({ sourceId, sourceOrder, url }) => ({ sourceId, sourceOrder, url })));
+    expect(fromFilePicker.map((source) => source.file)).toEqual(files);
+    expect(fromFilePicker.map((source) => source.blob.type)).toEqual(['image/jpeg', 'image/jpeg']);
+    expect(previewBlobs.slice(0, 2)).toEqual(fromFilePicker.map((source) => source.blob));
   });
 
   it('dekoder originalfilen med EXIF-orientering og bruker intrinsiske pikselmål', async () => {
@@ -666,9 +714,49 @@ Kupongnummer: 301646585.1`);
     expect(revokeObjectURL).toHaveBeenCalledWith('blob:samsung-fallback');
   });
 
-  it('beholder originalfilen OCR-lesbar når både vanlig preview og thumbnail-fallback feiler', async () => {
-    const file = new File(['lesbar original'], '3158.jpg', { type: 'image/jpeg', lastModified: 123 });
-    const [source] = createCanonicalImportSources([file], 0, () => 'blob:broken-preview');
+  it('rapporterer hvert dekodingsforsøk separat når ingen metode kan åpne bildet', async () => {
+    vi.stubGlobal('createImageBitmap', vi.fn().mockRejectedValue(new DOMException('Bitmap rejected', 'EncodingError')));
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal('URL', { createObjectURL: vi.fn(() => 'blob:decode-failure'), revokeObjectURL });
+    vi.stubGlobal('document', {
+      createElement: vi.fn(() => {
+        let onerror: (() => void) | null = null;
+        return {
+          decoding: '', naturalWidth: 0, naturalHeight: 0,
+          decode: vi.fn().mockRejectedValue(new DOMException('Image.decode rejected', 'EncodingError')),
+          set src(_value: string) { queueMicrotask(() => onerror?.()); },
+          get onerror() { return onerror; },
+          set onerror(value: (() => void) | null) { onerror = value; },
+          onload: null,
+        } as unknown as HTMLImageElement;
+      }),
+    });
+    class MockFileReader {
+      result: string | ArrayBuffer | null = null;
+      error: DOMException | null = null;
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      readAsDataURL() { this.result = 'data:image/jpeg;base64,/9j/'; queueMicrotask(() => this.onload?.()); }
+    }
+    vi.stubGlobal('FileReader', MockFileReader);
+    const blob = new Blob([new Uint8Array([0xff, 0xd8, 0xff])], { type: 'image/jpeg' });
+
+    await expect(decodeCanonicalCouponImage(blob)).rejects.toMatchObject({
+      name: 'CouponImageDecodeError',
+      attempts: [
+        { method: 'createImageBitmap med orientering', error: 'EncodingError: Bitmap rejected' },
+        { method: 'createImageBitmap uten options', error: 'EncodingError: Bitmap rejected' },
+        { method: 'object URL + bildeelement', error: expect.stringContaining('EncodingError: Image.decode rejected') },
+        { method: 'data URL + bildeelement', error: expect.stringContaining('EncodingError: Image.decode rejected') },
+        { method: 'lokal JPEG-dekoder', error: expect.any(String) },
+      ],
+    } satisfies Partial<CouponImageDecodeError>);
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:decode-failure');
+  });
+
+  it('beholder den normaliserte OCR-kilden ved en ren thumbnail-feil', async () => {
+    const file = new File([new Uint8Array([0xff, 0xd8, 0xff])], '3158.jpg', { type: '', lastModified: 123 });
+    const [source] = await createCanonicalImportSources([file], 0, () => 'blob:broken-preview');
     const revoke = vi.fn();
 
     const recovered = await recoverImportSourcePreview(
@@ -676,18 +764,53 @@ Kupongnummer: 301646585.1`);
       vi.fn().mockRejectedValue(new Error('Samsung thumbnail decode failed')),
       revoke,
     );
-    const [processed] = await processImportSourcesInOrder([recovered], async (item) => item.file.text());
+    const [processed] = await processImportSourcesInOrder([recovered], async (item) => item.blob.type);
 
-    expect(recovered).toMatchObject({ file, url: '', previewStatus: 'error' });
+    expect(recovered).toMatchObject({ file, url: '', previewStatus: 'error', previewFailure: 'preview' });
     expect(revoke).toHaveBeenCalledWith('blob:broken-preview');
-    expect(processed.result).toBe('lesbar original');
+    expect(processed.result).toBe('image/jpeg');
+  });
+
+  it('skiller en reell dekodingsfeil fra en ren preview-feil', async () => {
+    const file = new File([new Uint8Array([0xff, 0xd8, 0xff])], '3158.jpg', { type: 'image/jpeg' });
+    const [source] = await createCanonicalImportSources([file], 0, () => 'blob:broken-preview');
+    const nativeError = new CouponImageDecodeError([
+      { method: 'data URL + bildeelement', error: 'EncodingError: Bildet ble avvist' },
+    ]);
+
+    const recovered = await recoverImportSourcePreview(source, vi.fn().mockRejectedValue(nativeError), vi.fn());
+
+    expect(recovered).toMatchObject({
+      previewStatus: 'error',
+      previewFailure: 'decode',
+      decodeError: { stage: 'decode', sourceName: '3158.jpg', cause: nativeError },
+    });
+    expect(getImportFailureMessage(recovered.decodeError!)).toContain('Siste dekoderfeil: EncodingError: Bildet ble avvist');
+  });
+
+  it('beholder preview-URL til eksplisitt frigjøring og rydder tidligere URL-er dersom en senere fil avvises', async () => {
+    const createObjectURL = vi.fn(() => 'blob:validated-source');
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal('URL', { createObjectURL, revokeObjectURL });
+    const valid = new File([new Uint8Array([0xff, 0xd8, 0xff])], 'gyldig.jpg', { type: '' });
+    const invalid = new File([new Uint8Array([0x00, 0x01])], 'ugyldig.jpg', { type: 'image/jpeg' });
+
+    const [source] = await createCanonicalImportSources([valid]);
+    expect(createObjectURL).toHaveBeenCalledWith(source.blob);
+    expect(revokeObjectURL).not.toHaveBeenCalled();
+    releaseImportSourcePreview(source);
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:validated-source');
+
+    revokeObjectURL.mockClear();
+    await expect(createCanonicalImportSources([valid, invalid])).rejects.toMatchObject({ stage: 'decode' });
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:validated-source');
   });
 
   it('behandler filer med avgrenset samtidighet, stabil rekkefølge og isolerte feil', async () => {
-    const files = [0, 1, 2, 3, 4].map((index) => new File([String(index)], `313${index + 2}.jpg`, {
+    const files = [0, 1, 2, 3, 4].map((index) => new File([new Uint8Array([0xff, 0xd8, 0xff, index])], `313${index + 2}.jpg`, {
       type: 'image/jpeg', lastModified: index,
     }));
-    const sources = createCanonicalImportSources(files, 0, (file) => `fixture://${file.name}`);
+    const sources = await createCanonicalImportSources(files, 0, (_blob, file) => `fixture://${file.name}`);
     let active = 0;
     let maximumActive = 0;
     const settled: number[] = [];
@@ -715,10 +838,10 @@ Kupongnummer: 301646585.1`);
   });
 
   it('analyserer tre bilder før den behandler samlet 10 + 1 + 1 kuponger', async () => {
-    const files = ['bulk.jpg', 'enkelt-1.jpg', 'enkelt-2.jpg'].map((name, index) => new File([name], name, {
+    const files = ['bulk.jpg', 'enkelt-1.jpg', 'enkelt-2.jpg'].map((name, index) => new File([new Uint8Array([0xff, 0xd8, 0xff, index])], name, {
       type: 'image/jpeg', lastModified: index,
     }));
-    const sources = createCanonicalImportSources(files, 0, (file) => `fixture://${file.name}`);
+    const sources = await createCanonicalImportSources(files, 0, (_blob, file) => `fixture://${file.name}`);
     const analysisProgress: Array<[number, number]> = [];
     const couponProgress: Array<[number, number]> = [];
 
@@ -752,7 +875,7 @@ Kupongnummer: 301646585.1`);
   });
 
   it('avbryter aktiv fase og starter ikke flere kuponger', async () => {
-    const [source] = createCanonicalImportSources([new File(['x'], 'bulk.jpg', { type: 'image/jpeg' })], 0, () => 'fixture://bulk.jpg');
+    const [source] = await createCanonicalImportSources([new File([new Uint8Array([0xff, 0xd8, 0xff])], 'bulk.jpg', { type: 'image/jpeg' })], 0, () => 'fixture://bulk.jpg');
     const controller = new AbortController();
     let startedResolve!: () => void;
     const started = new Promise<void>((resolve) => { startedResolve = resolve; });
@@ -807,10 +930,10 @@ Kupongnummer: 301646585.1`);
     expect(getImportOcrConcurrency({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', maxTouchPoints: 0, userAgentData: { mobile: false } })).toBe(2);
   });
 
-  it('nullstiller filinputen før Importer flere åpner filvelgeren og frigjør preview-URL', () => {
+  it('nullstiller filinputen før Importer flere åpner filvelgeren og frigjør preview-URL', async () => {
     const input = { value: 'C:\\fakepath\\samme.jpg', click: vi.fn() };
     const revoke = vi.fn();
-    const [source] = createCanonicalImportSources([new File(['x'], 'samme.jpg', { type: 'image/jpeg' })], 0, () => 'blob:preview');
+    const [source] = await createCanonicalImportSources([new File([new Uint8Array([0xff, 0xd8, 0xff])], 'samme.jpg', { type: 'image/jpeg' })], 0, () => 'blob:preview');
 
     openImportFilePicker(input);
     releaseImportSourcePreview(source, revoke);

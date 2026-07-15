@@ -599,11 +599,13 @@ button { cursor: pointer; }
 .text-source { display: grid; gap: 8px; color: var(--muted); font-size: 13px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .text-source textarea { min-height: 280px; resize: vertical; padding: 15px; border: 1px solid var(--line); border-radius: 11px; outline: none; background: color-mix(in srgb, var(--surface-raised) 58%, transparent); color: var(--text); font: 15px/1.55 "Cascadia Mono", Consolas, monospace; }
 .text-source textarea:focus { border-color: var(--lime); box-shadow: 0 0 0 3px color-mix(in srgb, var(--lime) 14%, transparent); }
-.ocr-progress { display: grid; gap: 8px; margin-top: 13px; color: var(--muted); font-size: 12px; }
-.ocr-progress > div { display: flex; align-items: center; gap: 7px; }
-.ocr-progress::after { content: ""; grid-row: 2; height: 6px; border-radius: 999px; background: var(--surface-raised); }
-.ocr-progress i { z-index: 1; grid-row: 2; height: 6px; margin-top: -14px; border-radius: 999px; background: var(--lime); transition: width .2s ease; }
-.cancel-import-button { grid-row: 3; justify-self: start; min-height: 40px; display: inline-flex; align-items: center; gap: 6px; margin-top: 2px; padding: 0 13px; border: 1px solid color-mix(in srgb, var(--danger) 55%, var(--line)); border-radius: 8px; background: color-mix(in srgb, var(--danger) 7%, transparent); color: var(--danger); font: inherit; font-weight: 800; }
+.ocr-progress { display: grid; gap: 8px; margin-top: 13px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.ocr-progress-status { min-width: 0; display: flex; align-items: flex-start; gap: 7px; }
+.ocr-progress-status svg { flex: 0 0 auto; margin-top: 1px; }
+.ocr-progress-status span { min-width: 0; overflow-wrap: anywhere; }
+.ocr-progress-track { width: 100%; height: 6px; overflow: hidden; border-radius: 999px; background: var(--surface-raised); }
+.ocr-progress-track i { height: 100%; display: block; border-radius: inherit; background: var(--lime); transition: width .2s ease; }
+.cancel-import-button { justify-self: start; min-height: 40px; display: inline-flex; align-items: center; gap: 6px; margin-top: 2px; padding: 0 13px; border: 1px solid color-mix(in srgb, var(--danger) 55%, var(--line)); border-radius: 8px; background: color-mix(in srgb, var(--danger) 7%, transparent); color: var(--danger); font: inherit; font-weight: 800; }
 .spin { animation: spin .85s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .import-error { margin: 13px 0 0; padding: 11px 13px; border-left: 3px solid var(--danger); border-radius: 7px; background: color-mix(in srgb, var(--danger) 9%, transparent); color: color-mix(in srgb, var(--danger) 82%, var(--text)); font-size: 13px; font-weight: 700; }
