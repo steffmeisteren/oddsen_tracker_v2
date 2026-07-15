@@ -5,11 +5,23 @@ import {
   detectCouponBoxes,
   detectOcrGridBoxes,
   draftErrors,
+  evaluateImportFileSelection,
+  getImportFailureMessage,
+  getImportOcrConcurrency,
+  getImportReviewStatus,
+  getTesseractAssetPaths,
+  materializeMatchSort,
   mergePositionedWithText,
+  nextBetSort,
+  openImportFilePicker,
   parseCouponText,
   parsePositionedCoupon,
   processImportSourcesInOrder,
+  readImportFileSelection,
+  releaseImportSourcePreview,
+  sortBetsForDisplay,
   validateImportForPersistence,
+  type TrackedBet,
 } from './OddsenTracker';
 
 afterEach(() => {
@@ -544,20 +556,131 @@ Kupongnummer: 301646585.1`);
     expect(decoded).toMatchObject({ width: 2048, height: 945, source: fallbackBitmap });
   });
 
-  it('beholder filkoblingen selv om parallelt forarbeid fullfører i motsatt rekkefølge', async () => {
-    const files = [0, 1, 2, 3].map((index) => new File([String(index)], `313${index + 2}.jpg`, {
+  it('behandler filer med avgrenset samtidighet, stabil rekkefølge og isolerte feil', async () => {
+    const files = [0, 1, 2, 3, 4].map((index) => new File([String(index)], `313${index + 2}.jpg`, {
       type: 'image/jpeg', lastModified: index,
     }));
     const sources = createCanonicalImportSources(files, 0, (file) => `fixture://${file.name}`);
-    const completionOrder: number[] = [];
+    let active = 0;
+    let maximumActive = 0;
+    const settled: number[] = [];
     const completed = await processImportSourcesInOrder(sources, async (source) => {
-      await new Promise((resolve) => setTimeout(resolve, (4 - source.sourceOrder) * 3));
-      completionOrder.push(source.sourceOrder);
-      return source.file.name;
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, (5 - source.sourceOrder) * 2));
+        if (source.sourceOrder === 2) throw new Error('Uleselig bilde');
+        return source.file.name;
+      } finally {
+        active -= 1;
+      }
+    }, {
+      concurrency: 2,
+      onSourceSettled: (source) => settled.push(source.sourceOrder),
     });
 
-    expect(completionOrder).toEqual([3, 2, 1, 0]);
-    expect(completed.map(({ source, result }) => [source.sourceId, result])).toEqual(sources.map((source) => [source.sourceId, source.file.name]));
+    expect(maximumActive).toBe(2);
+    expect(completed.map(({ source }) => source.sourceOrder)).toEqual([0, 1, 2, 3, 4]);
+    expect(completed[2].error).toEqual(expect.any(Error));
+    expect(completed.filter(({ error }) => !error).map(({ source, result }) => [source.sourceId, result]))
+      .toEqual(sources.filter((source) => source.sourceOrder !== 2).map((source) => [source.sourceId, source.file.name]));
+    expect(settled.sort((a, b) => a - b)).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  it('tillater 50 bildefiler, advarer over 20 og blokkerer hele tillegget over 50', () => {
+    const images = Array.from({ length: 51 }, (_, index) => new File([String(index)], `bilde-${index + 1}.jpg`, { type: 'image/jpeg' }));
+
+    expect(evaluateImportFileSelection(images.slice(0, 20))).toMatchObject({ accepted: images.slice(0, 20), total: 20, warning: '', error: '' });
+    expect(evaluateImportFileSelection(images.slice(0, 21))).toMatchObject({ accepted: images.slice(0, 21), total: 21, warning: 'Mange bilder kan føre til lengre behandlingstid.', error: '' });
+    expect(evaluateImportFileSelection(images.slice(0, 50))).toMatchObject({ accepted: images.slice(0, 50), total: 50, error: '' });
+    expect(evaluateImportFileSelection(images, 0)).toMatchObject({ accepted: [], total: 51, error: 'Du kan velge maks 50 bilder per importomgang.' });
+    expect(evaluateImportFileSelection(images.slice(0, 2), 49)).toMatchObject({ accepted: [], total: 51, error: 'Du kan velge maks 50 bilder per importomgang.' });
+  });
+
+  it('bruker én OCR-jobb på mobil og to på desktop uten å basere seg på viewport', () => {
+    expect(getImportOcrConcurrency({ userAgent: 'Desktop', maxTouchPoints: 0, userAgentData: { mobile: true } })).toBe(1);
+    expect(getImportOcrConcurrency({ userAgent: 'Mozilla/5.0 (Linux; Android 15)', maxTouchPoints: 5 })).toBe(1);
+    expect(getImportOcrConcurrency({ userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) Version/18.0 Safari/605.1.15', maxTouchPoints: 5 })).toBe(1);
+    expect(getImportOcrConcurrency({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', maxTouchPoints: 0, userAgentData: { mobile: false } })).toBe(2);
+  });
+
+  it('nullstiller filinputen før Importer flere åpner filvelgeren og frigjør preview-URL', () => {
+    const input = { value: 'C:\\fakepath\\samme.jpg', click: vi.fn() };
+    const revoke = vi.fn();
+    const [source] = createCanonicalImportSources([new File(['x'], 'samme.jpg', { type: 'image/jpeg' })], 0, () => 'blob:preview');
+
+    openImportFilePicker(input);
+    releaseImportSourcePreview(source, revoke);
+
+    expect(input.value).toBe('');
+    expect(input.click).toHaveBeenCalledOnce();
+    expect(revoke).toHaveBeenCalledWith('blob:preview');
+  });
+
+  it('beholder Android-filreferansen etter at valget er lest, og nullstiller kun før neste åpning', () => {
+    const file = new File(['bilde'], '3150.jpg', { type: 'image/jpeg' });
+    const input = { files: { 0: file, length: 1, item: () => file }, value: 'content://media/3150.jpg' };
+
+    expect(readImportFileSelection(input)).toEqual([file]);
+    expect(input.value).toBe('content://media/3150.jpg');
+  });
+
+  it('bygger lokale OCR-ressursadresser fra GitHub Pages-basepath', () => {
+    expect(getTesseractAssetPaths('/oddsen_tracker_v2/')).toEqual({
+      workerPath: '/oddsen_tracker_v2/ocr/tesseract/worker.min.js',
+      corePath: '/oddsen_tracker_v2/ocr/tesseract/core',
+      langPath: '/oddsen_tracker_v2/ocr/tesseract/lang',
+      workerBlobURL: false,
+    });
+  });
+
+  it('viser stagespesifikke importfeil i stedet for samme språkdatafeil', () => {
+    expect(getImportFailureMessage({ stage: 'decode', sourceName: '3150.jpg' }))
+      .toBe('3150.jpg kunne ikke dekodes som PNG, JPG eller WEBP.');
+    expect(getImportFailureMessage({ stage: 'language', sourceName: '3150.jpg' }))
+      .toBe('OCR-språkdata kunne ikke lastes for 3150.jpg. Prøv igjen.');
+    expect(getImportFailureMessage({ stage: 'recognize', sourceName: '3150.jpg' }))
+      .toBe('Teksten i 3150.jpg kunne ikke gjenkjennes. Prøv igjen.');
+  });
+
+  it('viser rød status med eksakt antall ugyldige kort og grønn status først ved null feil', () => {
+    const [first] = parseCouponText(`Kamp: Frankrike vs Spania
+Starttid: 14.07.2026 21:00
+Konkurranse: Internasjonal - Fotball-VM
+Marked: Scorer mål
+Utfall: Kylian Mbappe
+Odds: 2.10
+Innsats: 500
+Mulig premie: 1050
+Kupongnummer: 301648248.1`);
+    const second = { ...first, id: crypto.randomUUID(), groupId: '301648249.1', coupon: '301648249.1', match: '' };
+
+    expect(getImportReviewStatus([first, second])).toMatchObject({
+      couponCount: 2,
+      selectionCount: 2,
+      invalidCardCount: 1,
+      tone: 'error',
+      message: '2 kuponger med 2 spillvalg til kontroll · 1 kort må rettes før lagring',
+    });
+    expect(getImportReviewStatus([{ ...first }, { ...second, match: 'Frankrike vs Spania' }])).toMatchObject({
+      invalidCardCount: 0,
+      tone: 'success',
+      message: '2 kuponger med 2 spillvalg er klare til lagring',
+    });
+  });
+
+  it('beholder alle OCR-ankere også når ett bilde inneholder mer enn 24 kuponger', () => {
+    const lines = Array.from({ length: 25 }, (_, index) => {
+      const column = index % 5;
+      const row = Math.floor(index / 5);
+      return {
+        text: `ID ${300000000 + index}.1`,
+        bbox: { x0: 40 + (column * 190), y0: 40 + (row * 190), x1: 150 + (column * 190), y1: 70 + (row * 190) },
+        words: [],
+      };
+    });
+
+    expect(detectOcrGridBoxes(1000, 1000, [{ paragraphs: [{ lines }] }])).toHaveLength(25);
   });
 
   it('avviser Oddsen og symbolstøy som deltakere ved parsing, merge og lagring', () => {
@@ -713,5 +836,95 @@ Kupongnummer: 301648248.1`);
 
     expect(item.match).toBe('');
     expect(draftErrors(item)).toContainEqual(expect.stringContaining('Bruk lagene'));
+  });
+
+  it.each([
+    ['England v\nArgentina', 'England vs Argentina'],
+    ['Paris Saint-Germain\nvs\nManchester United Football Club', 'Paris Saint-Germain vs Manchester United Football Club'],
+    ['Club Atletico de San Luis mot\nNew York City Football Club', 'Club Atletico de San Luis vs New York City Football Club'],
+    ['England v Argentina', 'England vs Argentina'],
+    ['Real Madrid Club de Futbol -\nBorussia Monchengladbach', 'Real Madrid Club de Futbol vs Borussia Monchengladbach'],
+    ['FC Kobenhavn\n- Rosenborg Ballklub', 'FC Kobenhavn vs Rosenborg Ballklub'],
+    ['England-\nArgentina', 'England vs Argentina'],
+    ['England\n-Argentina', 'England vs Argentina'],
+  ])('rekonstruerer kamp rundt tilfeldige OCR-linjeskift: %s', (eventLines, expected) => {
+    const [item] = parseCouponText(`Innsats: 100,00
+Odds: 2.50
+Mulig Premie: 250,00
+1. ${eventLines}
+Starttid: Fre. 10/7 21:00
+Konkurranse: Internasjonal - Fotball-VM
+Spillobjekt: Kampvinner
+Spilt utfall: Ja
+Levert: 10.07.2026
+Kupongnummer: 399999991.1`);
+
+    expect(item.match).toBe(expected);
+  });
+
+  it('rekonstruerer nummerert kamp også i posisjonert OCR', () => {
+    const row = (text: string, y: number) => ({ text, bbox: { x0: 20, y0: y, x1: 330, y1: y + 12 } });
+    const item = parsePositionedCoupon([{ paragraphs: [{ lines: [
+      row('Innsats: 100,00', 10), row('Odds: 2.50', 28), row('Mulig Premie: 250,00', 46),
+      row('1. England v', 80), row('Argentina', 98), row('Starttid:', 120), row('Fre. 10/7 21:00', 138),
+      row('Konkurranse:', 160), row('Internasjonal - Fotball-VM', 178), row('Spillobjekt:', 200),
+      row('Kampvinner', 218), row('Spilt utfall:', 240), row('Ja', 258), row('Levert: 10.07.2026', 280),
+      row('Kupongnummer: 399999992.1', 300),
+    ] }] }]);
+
+    expect(item?.match).toBe('England vs Argentina');
+  });
+
+  it('beholder alle ti England–Argentina-kuponger i OCR-tekstflyten', () => {
+    const receipts = Array.from({ length: 10 }, (_, index) => `Innsats: 100,00
+Odds: 2.50
+Mulig Premie: 250,00
+1. England v
+Argentina
+Starttid: Fre. 10/7 21:00
+Konkurranse: Internasjonal - Fotball-VM
+Spillobjekt: Kampvinner
+Spilt utfall: Ja
+Levert: 10.07.2026
+Kupongnummer: ${399999900 + index}.1`).join('\n\n');
+
+    const items = parseCouponText(receipts);
+
+    expect(items).toHaveLength(10);
+    expect(items.every((item) => item.match === 'England vs Argentina')).toBe(true);
+  });
+
+  it('sorterer tallkolonner stabilt uten å endre lagret rekkefølge', () => {
+    const bet = (id: string, odds: number, stake: number, payout: number): TrackedBet => ({
+      id, couponGroupId: id, match: 'England vs Argentina', kickoff: '10.07.2026 21:00',
+      competition: 'Internasjonal - Fotball-VM', coupon: id, category: 'Kamp', market: 'Kampvinner',
+      selection: 'Ja', odds, stake, payout,
+    });
+    const stored = [bet('a', 2.5, 100, 250), bet('b', 4.2, 300, 1260), bet('c', 2.5, 200, 500)];
+
+    expect(sortBetsForDisplay(stored, { key: 'odds', direction: 'desc' }).map((item) => item.id)).toEqual(['b', 'a', 'c']);
+    expect(sortBetsForDisplay(stored, { key: 'odds', direction: 'asc' }).map((item) => item.id)).toEqual(['a', 'c', 'b']);
+    expect(sortBetsForDisplay(stored, { key: 'stake', direction: 'desc' }).map((item) => item.id)).toEqual(['b', 'c', 'a']);
+    expect(sortBetsForDisplay(stored, { key: 'payout', direction: 'asc' }).map((item) => item.id)).toEqual(['a', 'c', 'b']);
+    expect(stored.map((item) => item.id)).toEqual(['a', 'b', 'c']);
+  });
+
+  it('starter automatisk sortering synkende og veksler bare det valgte feltet', () => {
+    const descending = nextBetSort(undefined, 'odds');
+    expect(descending).toEqual({ key: 'odds', direction: 'desc' });
+    expect(nextBetSort(descending, 'odds')).toEqual({ key: 'odds', direction: 'asc' });
+    expect(nextBetSort({ key: 'stake', direction: 'asc' }, 'payout')).toEqual({ key: 'payout', direction: 'desc' });
+  });
+
+  it('materialiserer bare aktuelt kampkort når dragging går tilbake til manuell rekkefølge', () => {
+    const bet = (id: string, match: string, odds: number): TrackedBet => ({
+      id, couponGroupId: id, match, kickoff: '10.07.2026 21:00', competition: 'VM', coupon: id,
+      category: 'Kamp', market: 'Kampvinner', selection: 'Ja', odds, stake: 100, payout: odds * 100,
+    });
+    const stored = [bet('a', 'England vs Argentina', 2), bet('x', 'Norge vs Spania', 8), bet('b', 'England vs Argentina', 4)];
+
+    expect(materializeMatchSort(stored, 'England vs Argentina', { key: 'odds', direction: 'desc' }).map((item) => item.id))
+      .toEqual(['b', 'x', 'a']);
+    expect(stored.map((item) => item.id)).toEqual(['a', 'x', 'b']);
   });
 });

@@ -2,7 +2,7 @@ import {
   useEffect, useMemo, useRef, useState, type ChangeEvent, type CSSProperties, type DragEvent, type KeyboardEvent,
 } from 'react';
 import {
-  Check, ChevronLeft, FileText, GripVertical, Image as ImageIcon, Loader2, Moon, Plus,
+  ArrowDown, ArrowUp, ArrowUpDown, Check, ChevronLeft, CircleAlert, FileText, GripVertical, Image as ImageIcon, Loader2, Moon, Plus,
   Sun, Trash2, Trophy, Upload, X,
 } from 'lucide-react';
 import { createWorker } from 'tesseract.js';
@@ -57,6 +57,120 @@ export interface ImportSource {
   sourceOrder: number;
 }
 
+export type BetSortKey = 'odds' | 'stake' | 'payout';
+export type BetSortDirection = 'asc' | 'desc';
+export interface BetSortState { key: BetSortKey; direction: BetSortDirection }
+
+export function nextBetSort(current: BetSortState | undefined, key: BetSortKey): BetSortState {
+  return current?.key === key
+    ? { key, direction: current.direction === 'desc' ? 'asc' : 'desc' }
+    : { key, direction: 'desc' };
+}
+
+export function sortBetsForDisplay(items: readonly TrackedBet[], sort?: BetSortState) {
+  if (!sort) return [...items];
+  const direction = sort.direction === 'desc' ? -1 : 1;
+  return items.map((item, index) => ({ item, index })).sort((left, right) => {
+    const difference = (left.item[sort.key] - right.item[sort.key]) * direction;
+    return difference || left.index - right.index;
+  }).map(({ item }) => item);
+}
+
+export function materializeMatchSort(items: readonly TrackedBet[], match: string, sort?: BetSortState) {
+  if (!sort) return [...items];
+  const sortedMatch = sortBetsForDisplay(items.filter((item) => item.match === match), sort);
+  let matchIndex = 0;
+  return items.map((item) => item.match === match ? sortedMatch[matchIndex++] : item);
+}
+
+export type CouponImportStage = 'preview' | 'decode' | 'segment' | 'worker' | 'core' | 'language' | 'initialize' | 'recognize';
+
+export class CouponImportError extends Error {
+  readonly stage: CouponImportStage;
+  readonly sourceName: string;
+  readonly cause?: unknown;
+
+  constructor(stage: CouponImportStage, sourceName: string, cause?: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause || stage));
+    this.name = 'CouponImportError';
+    this.stage = stage;
+    this.sourceName = sourceName;
+    this.cause = cause;
+  }
+}
+
+export function getImportFailureMessage(failure: Pick<CouponImportError, 'stage' | 'sourceName'>) {
+  const name = failure.sourceName || 'Bildet';
+  switch (failure.stage) {
+    case 'preview': return `Forhåndsvisningen av ${name} kunne ikke åpnes. Filen er beholdt.`;
+    case 'decode': return `${name} kunne ikke dekodes som PNG, JPG eller WEBP.`;
+    case 'segment': return `Kupongområdene i ${name} kunne ikke deles opp. Prøv igjen.`;
+    case 'worker': return `OCR-motoren kunne ikke startes for ${name}. Prøv igjen.`;
+    case 'core': return `OCR-kjernen kunne ikke lastes for ${name}. Prøv igjen.`;
+    case 'language': return `OCR-språkdata kunne ikke lastes for ${name}. Prøv igjen.`;
+    case 'initialize': return `OCR-motoren kunne ikke klargjøres for ${name}. Prøv igjen.`;
+    case 'recognize': return `Teksten i ${name} kunne ikke gjenkjennes. Prøv igjen.`;
+  }
+}
+
+function withImportStage(error: unknown, stage: CouponImportStage, sourceName: string) {
+  return error instanceof CouponImportError ? error : new CouponImportError(stage, sourceName, error);
+}
+
+export function getTesseractAssetPaths(baseUrl = import.meta.env.BASE_URL) {
+  const base = `${baseUrl || '/'}${String(baseUrl || '/').endsWith('/') ? '' : '/'}`;
+  return {
+    workerPath: `${base}ocr/tesseract/worker.min.js`,
+    corePath: `${base}ocr/tesseract/core`,
+    langPath: `${base}ocr/tesseract/lang`,
+    workerBlobURL: false,
+  };
+}
+
+export const MAX_IMPORT_FILES = 50;
+export const LARGE_IMPORT_WARNING_THRESHOLD = 20;
+export const LARGE_IMPORT_WARNING = 'Mange bilder kan føre til lengre behandlingstid.';
+
+interface ImportNavigatorLike {
+  userAgent?: string;
+  maxTouchPoints?: number;
+  userAgentData?: { mobile?: boolean };
+}
+
+export function evaluateImportFileSelection(files: readonly File[], existingCount = 0) {
+  const accepted = files.filter((file) => /^(?:image\/(?:png|jpe?g|pjpeg|webp))$/i.test(file.type) || /\.(?:png|jpe?g|webp)$/i.test(file.name));
+  const total = existingCount + accepted.length;
+  const warning = total > LARGE_IMPORT_WARNING_THRESHOLD ? LARGE_IMPORT_WARNING : '';
+  if (!accepted.length) return { accepted: [], total: existingCount, warning: '', error: 'Velg PNG-, JPG- eller WEBP-bilder.' };
+  if (total > MAX_IMPORT_FILES) return { accepted: [], total, warning, error: `Du kan velge maks ${MAX_IMPORT_FILES} bilder per importomgang.` };
+  return { accepted, total, warning, error: '' };
+}
+
+export function getImportOcrConcurrency(environment?: ImportNavigatorLike) {
+  const current = environment || (typeof navigator !== 'undefined' ? navigator as Navigator & ImportNavigatorLike : {});
+  const userAgent = current.userAgent || '';
+  const mobileAgent = /Android|iPhone|iPad|iPod|Mobile|IEMobile|Opera Mini/i.test(userAgent);
+  const desktopModeIPad = /Macintosh|Mac OS X/i.test(userAgent) && (current.maxTouchPoints ?? 0) > 1;
+  if (typeof current.userAgentData?.mobile === 'boolean') return current.userAgentData.mobile || desktopModeIPad ? 1 : 2;
+  return (mobileAgent && (current.maxTouchPoints ?? 1) > 0) || desktopModeIPad ? 1 : 2;
+}
+
+export function openImportFilePicker(input: Pick<HTMLInputElement, 'value' | 'click'>) {
+  input.value = '';
+  input.click();
+}
+
+export function readImportFileSelection(input: { files: FileList | ArrayLike<File> | null }) {
+  return Array.from(input.files || []);
+}
+
+export function releaseImportSourcePreview(
+  source: ImportSource,
+  revoke: (url: string) => void = (url) => URL.revokeObjectURL(url),
+) {
+  if (source.url.startsWith('blob:')) revoke(source.url);
+}
+
 export function createCanonicalImportSources(
   files: readonly File[],
   startOrder = 0,
@@ -64,12 +178,16 @@ export function createCanonicalImportSources(
 ): ImportSource[] {
   return files.map((file, index) => {
     const sourceOrder = startOrder + index;
-    return {
-      file,
-      url: createPreviewUrl(file),
-      sourceOrder,
-      sourceId: `${sourceOrder}:${file.name}:${file.size}:${file.lastModified}`,
-    };
+    try {
+      return {
+        file,
+        url: createPreviewUrl(file),
+        sourceOrder,
+        sourceId: `${sourceOrder}:${file.name}:${file.size}:${file.lastModified}`,
+      };
+    } catch (error) {
+      throw new CouponImportError('preview', file.name, error);
+    }
   });
 }
 
@@ -81,6 +199,10 @@ const STORAGE_KEY = 'oddsen-tracker:workspace-v6';
 
 function clean(value = '') {
   return String(value).replace(/[|]/g, ' ').replace(/\s+/g, ' ').replace(/^[\s:.-]+|[\s:.-]+$/g, '').trim();
+}
+
+function cleanMatchLine(value = '') {
+  return String(value).replace(/[|]/g, ' ').replace(/\s+/g, ' ').replace(/^[\s:.]+|[\s:.]+$/g, '').trim();
 }
 
 function numberFrom(value: unknown) {
@@ -260,7 +382,10 @@ function numberedEventCandidate(value: string) {
 }
 
 function numberedEventFromText(text: string) {
-  return normalizeOcrText(text).split('\n').map((line) => {
+  const lines = normalizeOcrText(text).split('\n').map(cleanMatchLine).filter(Boolean);
+  const reconstructed = reconstructHeadToHeadFromLines(lines, '', true);
+  if (reconstructed) return reconstructed;
+  return lines.map((line) => {
     const match = clean(line).match(/^\s*\d{1,2}[.)]\s+(.*)$/);
     return numberedEventCandidate(match?.[1] || '');
   }).find(Boolean) || '';
@@ -306,6 +431,30 @@ function safeHeadToHead(value: string, competition = '') {
   const home = safeMatchParticipant(candidate.slice(0, separator.index), competition);
   const away = safeMatchParticipant(candidate.slice(separator.index + separator[0].length), competition);
   return home && away ? `${home} vs ${away}` : '';
+}
+
+const MATCH_FIELD_BOUNDARY = /^(?:Innsats|Odds|Mulig Premie|Starttid|Kampstart|Konkurranse|Spillobjekt|Marked|Spilt utfall|Utfall|Spillvalg|Levert|Kupongnummer|Dato|ID)\b/i;
+
+function reconstructHeadToHeadFromLines(lines: readonly string[], competition = '', numberedOnly = false) {
+  for (let start = 0; start < lines.length; start += 1) {
+    const rawStart = cleanMatchLine(lines[start]);
+    const numbered = rawStart.match(/^\s*\d{1,2}[.)]\s+(.*)$/);
+    if (numberedOnly && !numbered) continue;
+    const parts = [cleanMatchLine(numbered?.[1] || rawStart)];
+    for (let end = start; end < Math.min(lines.length, start + 3); end += 1) {
+      if (end > start) {
+        const next = cleanMatchLine(lines[end]);
+        if (!next || MATCH_FIELD_BOUNDARY.test(next) || /^\s*\d{1,2}[.)]\s+/.test(next)) break;
+        parts.push(next);
+      }
+      const joined = parts.join(' ')
+        .replace(/(\S)[-–—]\s+(?=\S)/g, '$1 - ')
+        .replace(/(\S)\s+[-–—](?=\S)/g, '$1 - ');
+      const reconstructed = safeHeadToHead(joined, competition);
+      if (reconstructed) return reconstructed;
+    }
+  }
+  return '';
 }
 
 function eventMatchFallback(match: string, market: string, competition: string) {
@@ -378,7 +527,7 @@ function collectFollowingLines(lines: string[], start: number, stop: (line: stri
 
 function inferReceiptHints(text: string): ReceiptHints {
   const normalized = normalizeOcrText(text);
-  const lines = normalized.split('\n').map(clean).filter(Boolean);
+  const lines = normalized.split('\n').map(cleanMatchLine).filter(Boolean);
   const labelPattern = /^(?:Innsats|Odds|Mulig Premie|Starttid|Kampstart|Konkurranse|Spillobjekt|Marked|Spilt utfall|Utfall|Spillvalg|Levert|Kupongnummer)\b/i;
   const valueAfter = (label: RegExp) => {
     const index = lines.findIndex((line) => label.test(line));
@@ -408,9 +557,10 @@ function inferReceiptHints(text: string): ReceiptHints {
   }
 
   const numbered = numberedEventFromText(normalized);
-  const versus = lines.find((line) => !invalidMatchCandidate(line) && /\s(?:v|vs\.?|mot)\s/i.test(line));
-  const event = lines.find((line) => !invalidMatchCandidate(line) && /^(?:fotball.?vm|vm\s*2026|fifa world cup)/i.test(line));
   const marketIndex = lines.findIndex((line) => semanticMarketLine(line) && !receiptNoiseLine(line));
+  const matchAreaLines = lines.slice(0, marketIndex >= 0 ? marketIndex : lines.length);
+  const versus = reconstructHeadToHeadFromLines(matchAreaLines, competition) || matchAreaLines.find((line) => !invalidMatchCandidate(line) && /\s(?:v|vs\.?|mot)\s/i.test(line));
+  const event = lines.find((line) => !invalidMatchCandidate(line) && /^(?:fotball.?vm|vm\s*2026|fifa world cup)/i.test(line));
   const competitionIndex = competition ? lines.findIndex((line) => comparableMatchText(line) === comparableMatchText(competition)) : -1;
   const specialEvent = inferCategory(market) === 'Spesial'
     ? lines.slice(Math.max(0, competitionIndex + 1), marketIndex >= 0 ? marketIndex : lines.length)
@@ -734,7 +884,7 @@ export function detectCouponBoxes(image: PixelImage): CouponBox[] {
   const refined = detected.flatMap((box) => {
     const ratio = box.width / Math.max(1, box.height);
     if (ratio < 1.55) return [box];
-    const count = Math.max(2, Math.min(5, Math.round(ratio / .78)));
+    const count = Math.max(2, Math.round(ratio / .78));
     const cellWidth = box.width / count;
     return Array.from({ length: count }, (_, index) => {
       const x = Math.round(box.x + index * cellWidth);
@@ -750,6 +900,11 @@ export function detectCouponBoxes(image: PixelImage): CouponBox[] {
 
 async function canvasToBlob(canvas: HTMLCanvasElement, type = 'image/png', quality?: number) {
   return new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error('Kunne ikke opprette bilde.')), type, quality));
+}
+
+function releaseCanvas(canvas: HTMLCanvasElement) {
+  canvas.width = 1;
+  canvas.height = 1;
 }
 
 interface DecodedCouponImage {
@@ -906,89 +1061,108 @@ async function prepareCouponCanvas(
   const scale = Math.min(4, Math.max(1, targetWidth / Math.max(1, preparedCanvas.width)), maximumWidth / Math.max(1, preparedCanvas.width), maximumHeight / Math.max(1, preparedCanvas.height));
   const width = Math.max(1, Math.round(preparedCanvas.width * scale)); const height = Math.max(1, Math.round(preparedCanvas.height * scale));
   const normalized = document.createElement('canvas'); normalized.width = width; normalized.height = height;
-  const context = normalized.getContext('2d', { alpha: false, willReadFrequently: true });
-  if (!context) throw new Error('Canvas er ikke tilgjengelig.');
-  context.fillStyle = '#fff'; context.fillRect(0, 0, width, height); context.imageSmoothingEnabled = true; context.imageSmoothingQuality = 'high';
-  context.drawImage(preparedCanvas, 0, 0, preparedCanvas.width, preparedCanvas.height, 0, 0, width, height);
-
-  const sourcePixels = context.getImageData(0, 0, width, height);
-  const grayscale = new Uint8Array(width * height); let lumaSum = 0;
-  for (let index = 0; index < grayscale.length; index += 1) {
-    const offset = index * 4;
-    const luma = Math.round((sourcePixels.data[offset] * .299) + (sourcePixels.data[offset + 1] * .587) + (sourcePixels.data[offset + 2] * .114));
-    grayscale[index] = luma; lumaSum += luma;
-  }
-  const isDark = (lumaSum / Math.max(1, grayscale.length)) < 145;
-  const histogram = new Uint32Array(256);
-  for (let index = 0; index < grayscale.length; index += 1) {
-    const value = isDark ? 255 - grayscale[index] : grayscale[index];
-    grayscale[index] = value; histogram[value] += 1;
-  }
-  const low = histogramPercentile(histogram, grayscale.length, .01);
-  const high = histogramPercentile(histogram, grayscale.length, .99);
-  const range = Math.max(28, high - low);
-  const enhancedHistogram = new Uint32Array(256);
   const enhancedCanvas = document.createElement('canvas'); enhancedCanvas.width = width; enhancedCanvas.height = height;
-  const enhancedContext = enhancedCanvas.getContext('2d', { alpha: false }); if (!enhancedContext) throw new Error('Canvas er ikke tilgjengelig.');
-  const enhancedPixels = enhancedContext.createImageData(width, height);
-  for (let index = 0; index < grayscale.length; index += 1) {
-    const value = Math.max(0, Math.min(255, Math.round(((grayscale[index] - low) * 255) / range)));
-    grayscale[index] = value; enhancedHistogram[value] += 1;
-    const offset = index * 4;
-    enhancedPixels.data[offset] = value; enhancedPixels.data[offset + 1] = value; enhancedPixels.data[offset + 2] = value; enhancedPixels.data[offset + 3] = 255;
-  }
-  enhancedContext.putImageData(enhancedPixels, 0, 0);
-
-  const threshold = otsuThreshold(enhancedHistogram, grayscale.length);
   const binaryCanvas = document.createElement('canvas'); binaryCanvas.width = width; binaryCanvas.height = height;
-  const binaryContext = binaryCanvas.getContext('2d', { alpha: false }); if (!binaryContext) throw new Error('Canvas er ikke tilgjengelig.');
-  const binaryPixels = binaryContext.createImageData(width, height);
-  for (let index = 0; index < grayscale.length; index += 1) {
-    const value = grayscale[index] <= threshold ? 0 : 255;
-    const offset = index * 4;
-    binaryPixels.data[offset] = value; binaryPixels.data[offset + 1] = value; binaryPixels.data[offset + 2] = value; binaryPixels.data[offset + 3] = 255;
-  }
-  binaryContext.putImageData(binaryPixels, 0, 0);
+  try {
+    const context = normalized.getContext('2d', { alpha: false, willReadFrequently: true });
+    if (!context) throw new Error('Canvas er ikke tilgjengelig.');
+    context.fillStyle = '#fff'; context.fillRect(0, 0, width, height); context.imageSmoothingEnabled = true; context.imageSmoothingQuality = 'high';
+    context.drawImage(preparedCanvas, 0, 0, preparedCanvas.width, preparedCanvas.height, 0, 0, width, height);
 
-  return {
-    blob: await canvasToBlob(normalized),
-    ocrBlob: await canvasToBlob(enhancedCanvas),
-    binaryBlob: await canvasToBlob(binaryCanvas),
-    previewUrl: normalized.toDataURL('image/jpeg', .9),
-    box,
-    sourceName,
-    sourceId,
-    sourceOrder,
-    regionOrder,
-    isDark,
-  };
+    const sourcePixels = context.getImageData(0, 0, width, height);
+    const grayscale = new Uint8Array(width * height); let lumaSum = 0;
+    for (let index = 0; index < grayscale.length; index += 1) {
+      const offset = index * 4;
+      const luma = Math.round((sourcePixels.data[offset] * .299) + (sourcePixels.data[offset + 1] * .587) + (sourcePixels.data[offset + 2] * .114));
+      grayscale[index] = luma; lumaSum += luma;
+    }
+    const isDark = (lumaSum / Math.max(1, grayscale.length)) < 145;
+    const histogram = new Uint32Array(256);
+    for (let index = 0; index < grayscale.length; index += 1) {
+      const value = isDark ? 255 - grayscale[index] : grayscale[index];
+      grayscale[index] = value; histogram[value] += 1;
+    }
+    const low = histogramPercentile(histogram, grayscale.length, .01);
+    const high = histogramPercentile(histogram, grayscale.length, .99);
+    const range = Math.max(28, high - low);
+    const enhancedHistogram = new Uint32Array(256);
+    const enhancedContext = enhancedCanvas.getContext('2d', { alpha: false }); if (!enhancedContext) throw new Error('Canvas er ikke tilgjengelig.');
+    const enhancedPixels = enhancedContext.createImageData(width, height);
+    for (let index = 0; index < grayscale.length; index += 1) {
+      const value = Math.max(0, Math.min(255, Math.round(((grayscale[index] - low) * 255) / range)));
+      grayscale[index] = value; enhancedHistogram[value] += 1;
+      const offset = index * 4;
+      enhancedPixels.data[offset] = value; enhancedPixels.data[offset + 1] = value; enhancedPixels.data[offset + 2] = value; enhancedPixels.data[offset + 3] = 255;
+    }
+    enhancedContext.putImageData(enhancedPixels, 0, 0);
+
+    const threshold = otsuThreshold(enhancedHistogram, grayscale.length);
+    const binaryContext = binaryCanvas.getContext('2d', { alpha: false }); if (!binaryContext) throw new Error('Canvas er ikke tilgjengelig.');
+    const binaryPixels = binaryContext.createImageData(width, height);
+    for (let index = 0; index < grayscale.length; index += 1) {
+      const value = grayscale[index] <= threshold ? 0 : 255;
+      const offset = index * 4;
+      binaryPixels.data[offset] = value; binaryPixels.data[offset + 1] = value; binaryPixels.data[offset + 2] = value; binaryPixels.data[offset + 3] = 255;
+    }
+    binaryContext.putImageData(binaryPixels, 0, 0);
+
+    return {
+      blob: await canvasToBlob(normalized),
+      ocrBlob: await canvasToBlob(enhancedCanvas),
+      binaryBlob: await canvasToBlob(binaryCanvas),
+      previewUrl: normalized.toDataURL('image/jpeg', .9),
+      box,
+      sourceName,
+      sourceId,
+      sourceOrder,
+      regionOrder,
+      isDark,
+    };
+  } finally {
+    releaseCanvas(normalized);
+    releaseCanvas(enhancedCanvas);
+    releaseCanvas(binaryCanvas);
+    if (preparedCanvas !== canvas) releaseCanvas(preparedCanvas);
+  }
 }
 
 async function segmentCouponImage(source: ImportSource): Promise<CouponRegion[]> {
-  const bitmap = await decodeCanonicalCouponImage(source.file);
+  const bitmap = await decodeCanonicalCouponImage(source.file).catch((error) => {
+    throw withImportStage(error, 'decode', source.file.name);
+  });
   const canvas = document.createElement('canvas'); canvas.width = bitmap.width; canvas.height = bitmap.height;
-  const context = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
-  if (!context) { bitmap.close(); throw new Error('Canvas er ikke tilgjengelig.'); }
-  context.fillStyle = '#fff'; context.fillRect(0, 0, canvas.width, canvas.height); context.drawImage(bitmap.source, 0, 0);
-  const boxes = detectCouponBoxes(context.getImageData(0, 0, canvas.width, canvas.height));
-  const regions: CouponRegion[] = [];
-  for (let index = 0; index < boxes.length; index += 1) {
-    const box = boxes[index];
-    const crop = document.createElement('canvas'); crop.width = Math.max(1, Math.round(box.width)); crop.height = Math.max(1, Math.round(box.height));
-    const cropContext = crop.getContext('2d', { alpha: false }); if (!cropContext) continue;
-    cropContext.fillStyle = '#fff'; cropContext.fillRect(0, 0, crop.width, crop.height);
-    cropContext.drawImage(bitmap.source, box.x, box.y, box.width, box.height, 0, 0, crop.width, crop.height);
-    regions.push(await prepareCouponCanvas(
-      crop,
-      box,
-      `${source.file.name} · utsnitt ${index + 1}`,
-      source.sourceId,
-      source.sourceOrder,
-      index,
-    ));
+  try {
+    const context = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
+    if (!context) throw new Error('Canvas er ikke tilgjengelig.');
+    context.fillStyle = '#fff'; context.fillRect(0, 0, canvas.width, canvas.height); context.drawImage(bitmap.source, 0, 0);
+    const boxes = detectCouponBoxes(context.getImageData(0, 0, canvas.width, canvas.height));
+    const regions: CouponRegion[] = [];
+    for (let index = 0; index < boxes.length; index += 1) {
+      const box = boxes[index];
+      const crop = document.createElement('canvas'); crop.width = Math.max(1, Math.round(box.width)); crop.height = Math.max(1, Math.round(box.height));
+      try {
+        const cropContext = crop.getContext('2d', { alpha: false }); if (!cropContext) continue;
+        cropContext.fillStyle = '#fff'; cropContext.fillRect(0, 0, crop.width, crop.height);
+        cropContext.drawImage(bitmap.source, box.x, box.y, box.width, box.height, 0, 0, crop.width, crop.height);
+        regions.push(await prepareCouponCanvas(
+          crop,
+          box,
+          `${source.file.name} · utsnitt ${index + 1}`,
+          source.sourceId,
+          source.sourceOrder,
+          index,
+        ));
+      } finally {
+        releaseCanvas(crop);
+      }
+    }
+    return regions;
+  } catch (error) {
+    throw withImportStage(error, 'segment', source.file.name);
+  } finally {
+    bitmap.close();
+    releaseCanvas(canvas);
   }
-  bitmap.close();
-  return regions;
 }
 
 interface OcrBox { x0: number; y0: number; x1: number; y1: number; }
@@ -1414,7 +1588,11 @@ export function parsePositionedCoupon(blocks: unknown, sourceName?: string, sour
       : rows;
     const labeledKickoff = resolvePositionedKickoff(kickoffCandidateFromRows(kickoffRows), purchaseText);
     const matchRow = rows.find((row) => /^\s*\d{1,2}[.)]\s+(?=.*[A-Za-zÆØÅæøå])/.test(row.text));
-    const labeledMatch = clean(matchRow?.text.replace(/^\s*\d{1,2}[.)]\s+/, '') || '');
+    const matchRowIndex = matchRow ? rows.indexOf(matchRow) : -1;
+    const reconstructedMatch = matchRowIndex >= 0
+      ? reconstructHeadToHeadFromLines(rows.slice(matchRowIndex, matchRowIndex + 3).map((row) => row.text), labeledCompetition, true)
+      : '';
+    const labeledMatch = reconstructedMatch || clean(matchRow?.text.replace(/^\s*\d{1,2}[.)]\s+/, '') || '');
     const item = draft();
     return reconcileDraftEconomics({
       ...item,
@@ -1470,7 +1648,7 @@ export function parsePositionedCoupon(blocks: unknown, sourceName?: string, sour
   const matchRows = contentRows.slice(0, Math.max(0, marketStart)).map((row) => removeKickoffCandidate(row.text)).filter((value) =>
     value && !positionedNoiseRow(value) && !summaryLabelRow(value) && clean(value) !== competition);
   let match = '';
-  const explicitVersus = matchRows.find((value) => /\s(?:v|vs\.?|mot)\s/i.test(value));
+  const explicitVersus = reconstructHeadToHeadFromLines(matchRows, competition) || matchRows.find((value) => /\s(?:v|vs\.?|mot)\s/i.test(value));
   const special = /spesial/i.test(competition) || /vinner.*(?:vm|turnering)|golden boot|toppscorer/i.test(market);
   if (explicitVersus) match = normalizeVersusMatch(explicitVersus);
   else if (!special) {
@@ -1565,18 +1743,23 @@ function dedupeAnchors(anchors: OcrBox[], width: number, height: number) {
 async function cropRegion(region: CouponRegion, box: CouponBox, suffix: string): Promise<CouponRegion> {
   const bitmap = await decodeCanonicalCouponImage(region.blob);
   const crop = document.createElement('canvas'); crop.width = Math.max(1, Math.round(box.width)); crop.height = Math.max(1, Math.round(box.height));
-  const context = crop.getContext('2d', { alpha: false });
-  if (!context) { bitmap.close(); throw new Error('Canvas er ikke tilgjengelig.'); }
-  context.fillStyle = '#fff'; context.fillRect(0, 0, crop.width, crop.height);
-  context.drawImage(bitmap.source, box.x, box.y, box.width, box.height, 0, 0, crop.width, crop.height); bitmap.close();
-  return prepareCouponCanvas(
-    crop,
-    box,
-    `${region.sourceName} · ${suffix}`,
-    region.sourceId,
-    region.sourceOrder,
-    region.regionOrder,
-  );
+  try {
+    const context = crop.getContext('2d', { alpha: false });
+    if (!context) throw new Error('Canvas er ikke tilgjengelig.');
+    context.fillStyle = '#fff'; context.fillRect(0, 0, crop.width, crop.height);
+    context.drawImage(bitmap.source, box.x, box.y, box.width, box.height, 0, 0, crop.width, crop.height);
+    return await prepareCouponCanvas(
+      crop,
+      box,
+      `${region.sourceName} · ${suffix}`,
+      region.sourceId,
+      region.sourceOrder,
+      region.regionOrder,
+    );
+  } finally {
+    bitmap.close();
+    releaseCanvas(crop);
+  }
 }
 
 export function detectOcrGridBoxes(width: number, height: number, blocks: unknown): CouponBox[] {
@@ -1595,7 +1778,7 @@ export function detectOcrGridBoxes(width: number, height: number, blocks: unknow
 
   const centers = anchors.map((anchor) => ({ x: (anchor.x0 + anchor.x1) / 2, y: (anchor.y0 + anchor.y1) / 2 }));
   const columns = clusterCoordinates(centers.map((center) => center.x), width * .16);
-  if (columns.length < 1 || anchors.length > 24) return [];
+  if (columns.length < 1) return [];
 
   const boundaries = (centersList: number[], maximum: number) => centersList.map((center, index) => ({
     start: index === 0 ? 0 : Math.round((centersList[index - 1] + center) / 2),
@@ -1677,22 +1860,29 @@ function dedupeOcrLines(parts: string[]) {
 
 async function recognizeTiledText(worker: Awaited<ReturnType<typeof createWorker>>, region: CouponRegion) {
   const bitmap = await decodeCanonicalCouponImage(region.isDark ? region.binaryBlob : region.ocrBlob);
-  if (bitmap.height / Math.max(1, bitmap.width) < 1.45) { bitmap.close(); return ''; }
-  const tileHeight = Math.min(bitmap.height, Math.max(720, Math.round(bitmap.width * 1.35)));
-  const tileStep = Math.max(1, Math.round(tileHeight * .88));
-  const texts: string[] = [];
-  for (let y = 0; y < bitmap.height; y += tileStep) {
-    const top = Math.min(y, Math.max(0, bitmap.height - tileHeight));
-    const height = Math.min(tileHeight, bitmap.height - top);
-    const tile = document.createElement('canvas'); tile.width = bitmap.width; tile.height = height;
-    const context = tile.getContext('2d', { alpha: false }); if (!context) continue;
-    context.fillStyle = '#fff'; context.fillRect(0, 0, tile.width, tile.height);
-    context.drawImage(bitmap.source, 0, top, bitmap.width, height, 0, 0, tile.width, height);
-    texts.push((await worker.recognize(await canvasToBlob(tile))).data.text);
-    if (top + height >= bitmap.height) break;
+  try {
+    if (bitmap.height / Math.max(1, bitmap.width) < 1.45) return '';
+    const tileHeight = Math.min(bitmap.height, Math.max(720, Math.round(bitmap.width * 1.35)));
+    const tileStep = Math.max(1, Math.round(tileHeight * .88));
+    const texts: string[] = [];
+    for (let y = 0; y < bitmap.height; y += tileStep) {
+      const top = Math.min(y, Math.max(0, bitmap.height - tileHeight));
+      const height = Math.min(tileHeight, bitmap.height - top);
+      const tile = document.createElement('canvas'); tile.width = bitmap.width; tile.height = height;
+      try {
+        const context = tile.getContext('2d', { alpha: false }); if (!context) continue;
+        context.fillStyle = '#fff'; context.fillRect(0, 0, tile.width, tile.height);
+        context.drawImage(bitmap.source, 0, top, bitmap.width, height, 0, 0, tile.width, height);
+        texts.push((await worker.recognize(await canvasToBlob(tile))).data.text);
+      } finally {
+        releaseCanvas(tile);
+      }
+      if (top + height >= bitmap.height) break;
+    }
+    return dedupeOcrLines(texts);
+  } finally {
+    bitmap.close();
   }
-  bitmap.close();
-  return dedupeOcrLines(texts);
 }
 
 function importedDraftCoreComplete(item: ImportDraft) {
@@ -1789,51 +1979,107 @@ export function draftErrors(item: ImportDraft) {
   return [...new Set(errors)];
 }
 
+export function getImportReviewStatus(items: readonly ImportDraft[]) {
+  const couponCount = new Set(items.map((item) => item.coupon || item.groupId)).size;
+  const selectionCount = items.length;
+  const invalidCardCount = items.filter((item) => draftErrors(item).length > 0).length;
+  const couponLabel = couponCount === 1 ? 'kupong' : 'kuponger';
+  if (invalidCardCount > 0) {
+    return {
+      couponCount,
+      selectionCount,
+      invalidCardCount,
+      tone: 'error' as const,
+      message: `${couponCount} ${couponLabel} med ${selectionCount} spillvalg til kontroll · ${invalidCardCount} kort må rettes før lagring`,
+    };
+  }
+  return {
+    couponCount,
+    selectionCount,
+    invalidCardCount,
+    tone: 'success' as const,
+    message: `${couponCount} ${couponLabel} med ${selectionCount} spillvalg er klare til lagring`,
+  };
+}
+
 export interface CanonicalImportPipelineOptions {
   onProgress?: (progress: number) => void;
   onDetectedRegions?: (count: number) => void;
+  onFileProgress?: (completed: number, total: number) => void;
+  onSourceSettled?: (source: ImportSource, error?: unknown) => void;
+  concurrency?: number;
   workerFactory?: typeof createWorker;
 }
 
 export interface CanonicalImportPipelineResult {
   drafts: ImportDraft[];
   detectedRegions: number;
+  failures: Array<{ sourceId: string; sourceName: string; stage: CouponImportStage; message: string; error: CouponImportError }>;
+}
+
+interface ImportSourceQueueOptions {
+  concurrency?: number;
+  onSourceSettled?: (source: ImportSource, error?: unknown) => void;
+}
+
+export interface ImportSourceQueueResult<T> {
+  source: ImportSource;
+  result?: T;
+  error?: unknown;
 }
 
 export async function processImportSourcesInOrder<T>(
   sources: readonly ImportSource[],
   processSource: (source: ImportSource) => Promise<T>,
-) {
-  const completed = await Promise.all(sources.map(async (source) => ({
-    source,
-    result: await processSource(source),
-  })));
-  return completed.sort((a, b) => a.source.sourceOrder - b.source.sourceOrder);
+  options: ImportSourceQueueOptions = {},
+): Promise<Array<ImportSourceQueueResult<T>>> {
+  const ordered = [...sources].sort((a, b) => a.sourceOrder - b.sourceOrder);
+  const completed = new Array<ImportSourceQueueResult<T>>(ordered.length);
+  let nextIndex = 0;
+  const concurrency = Math.max(1, Math.min(ordered.length || 1, Math.floor(options.concurrency || 1)));
+  const workers = Array.from({ length: concurrency }, async () => {
+    while (nextIndex < ordered.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const source = ordered[index];
+      try {
+        completed[index] = { source, result: await processSource(source) };
+      } catch (error) {
+        completed[index] = { source, error };
+      } finally {
+        options.onSourceSettled?.(source, completed[index]?.error);
+      }
+    }
+  });
+  await Promise.all(workers);
+  return completed;
 }
 
-/**
- * The only image-import pipeline. File picker, drag-and-drop and a mobile
- * camera/file chooser all pass the original File objects into this function.
- */
-export async function importCouponFiles(
-  sources: readonly ImportSource[],
-  options: CanonicalImportPipelineOptions = {},
-): Promise<CanonicalImportPipelineResult> {
-  const orderedSources = [...sources].sort((a, b) => a.sourceOrder - b.sourceOrder);
-  const batches = await processImportSourcesInOrder(orderedSources, segmentCouponImage);
-  const initialRegions = batches.flatMap(({ result }) => result)
+async function importCouponSource(
+  source: ImportSource,
+  workerFactory: typeof createWorker,
+  onProgress?: (progress: number) => void,
+) {
+  const initialRegions = (await segmentCouponImage(source))
     .sort((a, b) => (a.sourceOrder - b.sourceOrder) || (a.regionOrder - b.regionOrder));
-  if (!initialRegions.length) throw new Error('Ingen kupongområder ble funnet.');
+  if (!initialRegions.length) throw new CouponImportError('segment', source.file.name, new Error('Ingen kupongområder ble funnet.'));
 
   let activeRegionIndex = 0;
   let progressTotal = initialRegions.length;
-  const workerFactory = options.workerFactory || createWorker;
+  let loadingStage: CouponImportStage = 'worker';
   const worker = await workerFactory('nor+eng', 1, {
+    ...getTesseractAssetPaths(),
     logger: (message) => {
-      if (message.status === 'recognizing text') {
-        options.onProgress?.((activeRegionIndex + message.progress) / Math.max(1, progressTotal));
+      if (message.status === 'loading tesseract core') loadingStage = 'core';
+      else if (message.status === 'loading language traineddata') loadingStage = 'language';
+      else if (message.status === 'initializing tesseract') loadingStage = 'initialize';
+      else if (message.status === 'recognizing text') {
+        loadingStage = 'recognize';
+        onProgress?.((activeRegionIndex + message.progress) / Math.max(1, progressTotal));
       }
     },
+  }).catch((error) => {
+    throw withImportStage(error, loadingStage, source.file.name);
   });
 
   try {
@@ -1842,8 +2088,12 @@ export async function importCouponFiles(
     for (let index = 0; index < initialRegions.length; index += 1) {
       activeRegionIndex = index;
       const region = initialRegions[index];
-      const preliminary = await recognizeBestRegion(worker, region, true);
-      const split = await splitRegionByOcrAnchors(region, preliminary.data.blocks);
+      const preliminary = await recognizeBestRegion(worker, region, true).catch((error) => {
+        throw withImportStage(error, 'recognize', source.file.name);
+      });
+      const split = await splitRegionByOcrAnchors(region, preliminary.data.blocks).catch((error) => {
+        throw withImportStage(error, 'segment', source.file.name);
+      });
       if (split.length > 1) {
         split.forEach((cell, splitIndex) => finalRegions.push({
           ...cell,
@@ -1856,16 +2106,18 @@ export async function importCouponFiles(
     }
 
     finalRegions.sort((a, b) => (a.sourceOrder - b.sourceOrder) || (a.regionOrder - b.regionOrder));
-    options.onDetectedRegions?.(finalRegions.length);
     progressTotal = finalRegions.length;
     const found: ImportDraft[] = [];
-
     for (let index = 0; index < finalRegions.length; index += 1) {
       activeRegionIndex = index;
       const region = finalRegions[index];
-      const recognition = cachedRecognition.get(region.blob) || await recognizeBestRegion(worker, region, true);
+      const recognition = cachedRecognition.get(region.blob) || await recognizeBestRegion(worker, region, true).catch((error) => {
+        throw withImportStage(error, 'recognize', source.file.name);
+      });
       const positioned = parsePositionedCoupon(recognition.data.blocks, region.sourceName, region.previewUrl);
-      const texts = await recognizeRegionTexts(worker, region, recognition.data.text);
+      const texts = await recognizeRegionTexts(worker, region, recognition.data.text).catch((error) => {
+        throw withImportStage(error, 'recognize', source.file.name);
+      });
       const textCandidates = parseCouponCandidates(texts, region.sourceName, region.previewUrl);
       const parsed = mergePositionedWithText(positioned, textCandidates);
       const regionDrafts = parsed.length ? parsed : [{ ...draft(), sourceName: region.sourceName, sourcePreview: region.previewUrl }];
@@ -1875,15 +2127,72 @@ export async function importCouponFiles(
         sourceOrder: region.sourceOrder,
         regionOrder: region.regionOrder,
       })));
-      options.onProgress?.((index + 1) / finalRegions.length);
+      onProgress?.((index + 1) / Math.max(1, finalRegions.length));
     }
-
-    const drafts = reconcileImportedDrafts(found)
-      .sort((a, b) => ((a.sourceOrder ?? 0) - (b.sourceOrder ?? 0)) || ((a.regionOrder ?? 0) - (b.regionOrder ?? 0)));
-    return { drafts, detectedRegions: finalRegions.length };
+    return { drafts: reconcileImportedDrafts(found), detectedRegions: finalRegions.length };
   } finally {
-    await worker.terminate();
+    try { await worker.terminate(); } catch (error) {
+      console.warn('[coupon-import] OCR-worker kunne ikke avsluttes rent.', { sourceId: source.sourceId, sourceName: source.file.name, error });
+    }
   }
+}
+
+/**
+ * The only image-import pipeline. File picker, drag-and-drop and a mobile
+ * camera/file chooser all pass the original File objects into this function.
+ */
+export async function importCouponFiles(
+  sources: readonly ImportSource[],
+  options: CanonicalImportPipelineOptions = {},
+): Promise<CanonicalImportPipelineResult> {
+  const orderedSources = [...sources].sort((a, b) => a.sourceOrder - b.sourceOrder);
+  const workerFactory = options.workerFactory || createWorker;
+  const sourceProgress = new Map<string, number>();
+  let completedCount = 0;
+  let detectedRegions = 0;
+  const updateOverallProgress = () => options.onProgress?.(
+    orderedSources.length
+      ? orderedSources.reduce((sum, source) => sum + (sourceProgress.get(source.sourceId) || 0), 0) / orderedSources.length
+      : 0,
+  );
+  const batches = await processImportSourcesInOrder(orderedSources, async (source) => importCouponSource(
+    source,
+    workerFactory,
+    (progress) => {
+      sourceProgress.set(source.sourceId, progress);
+      updateOverallProgress();
+    },
+  ), {
+    concurrency: options.concurrency,
+    onSourceSettled: (source, error) => {
+      sourceProgress.set(source.sourceId, 1);
+      completedCount += 1;
+      updateOverallProgress();
+      options.onFileProgress?.(completedCount, orderedSources.length);
+      options.onSourceSettled?.(source, error);
+    },
+  });
+
+  const failures = batches.flatMap(({ source, error }) => {
+    if (!error) return [];
+    const importError = withImportStage(error, 'recognize', source.file.name);
+    const message = getImportFailureMessage(importError);
+    console.error('[coupon-import]', {
+      stage: importError.stage,
+      sourceId: source.sourceId,
+      sourceName: source.file.name,
+      message,
+      error: importError.cause || importError,
+    });
+    return [{ sourceId: source.sourceId, sourceName: source.file.name, stage: importError.stage, message, error: importError }];
+  });
+  const drafts = batches.flatMap(({ result }) => {
+    if (!result) return [];
+    detectedRegions += result.detectedRegions;
+    return result.drafts;
+  }).sort((a, b) => ((a.sourceOrder ?? 0) - (b.sourceOrder ?? 0)) || ((a.regionOrder ?? 0) - (b.regionOrder ?? 0)));
+  options.onDetectedRegions?.(detectedRegions);
+  return { drafts, detectedRegions, failures };
 }
 
 export interface ValidatedImportBatch {
@@ -2047,6 +2356,7 @@ export function OddsenTracker() {
   const [bets, setBets] = useState<TrackedBet[]>(readStoredBets);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [filters, setFilters] = useState<Record<string, 'Alle' | Category>>({});
+  const [sorts, setSorts] = useState<Record<string, BetSortState | undefined>>({});
   const [draggedId, setDraggedId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; edge: 'before' | 'after' } | null>(null);
   const [settlingId, setSettlingId] = useState<string | null>(null);
@@ -2055,12 +2365,16 @@ export function OddsenTracker() {
   const [importStep, setImportStep] = useState<ImportStep>('source');
   const [importText, setImportText] = useState('');
   const [uploadFiles, setUploadFiles] = useState<ImportSource[]>([]);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const pendingAdditionalImport = useRef<{ preserveDrafts: boolean } | null>(null);
   const nextSourceOrder = useRef(0);
   const [drafts, setDrafts] = useState<ImportDraft[]>([]);
   const [ocrBusy, setOcrBusy] = useState(false);
   const [ocrProgress, setOcrProgress] = useState(0);
+  const [ocrFileProgress, setOcrFileProgress] = useState({ current: 0, total: 0 });
   const [detectedRegions, setDetectedRegions] = useState(0);
   const [importError, setImportError] = useState('');
+  const [importWarning, setImportWarning] = useState('');
   const [importedCount, setImportedCount] = useState(0);
   const [appendImport, setAppendImport] = useState(false);
 
@@ -2072,7 +2386,11 @@ export function OddsenTracker() {
 
   const totals = useMemo(() => trackedSummary(bets), [bets]);
   const matchGroups = useMemo(() => [...new Set(bets.map((bet) => bet.match))].map((match) => ({ match, bets: bets.filter((bet) => bet.match === match) })), [bets]);
-  const draftCouponCount = new Set(drafts.map((item) => item.coupon || item.groupId)).size;
+  const reviewStatus = useMemo(() => getImportReviewStatus(drafts), [drafts]);
+  const draftCouponCount = reviewStatus.couponCount;
+  const importOcrConcurrency = useMemo(() => getImportOcrConcurrency(), []);
+  const mobileImportEnvironment = importOcrConcurrency === 1;
+  const selectedFileWarning = uploadFiles.length > LARGE_IMPORT_WARNING_THRESHOLD ? LARGE_IMPORT_WARNING : '';
 
   function toggleBet(id: string) {
     setSelected((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
@@ -2090,7 +2408,30 @@ export function OddsenTracker() {
   }
 
   function beginDrag(event: DragEvent<HTMLElement>, id: string) {
+    const dragged = bets.find((bet) => bet.id === id);
+    if (dragged && sorts[dragged.match]) {
+      setBets((current) => materializeMatchSort(current, dragged.match, sorts[dragged.match]));
+      setSorts((current) => ({ ...current, [dragged.match]: undefined }));
+    }
     setDraggedId(id); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', id);
+  }
+
+  function toggleMatchSort(match: string, key: BetSortKey) {
+    setSorts((current) => ({ ...current, [match]: nextBetSort(current[match], key) }));
+  }
+
+  function renderSortButton(match: string, key: BetSortKey, label: string) {
+    const sort = sorts[match];
+    const active = sort?.key === key;
+    const SortIcon = !active ? ArrowUpDown : sort.direction === 'desc' ? ArrowDown : ArrowUp;
+    const direction = active ? (sort.direction === 'desc' ? 'høyest til lavest' : 'lavest til høyest') : 'ikke aktiv';
+    return <button
+      type="button"
+      className={`bet-sort-button bet-sort-${key} ${active ? 'active' : ''}`}
+      aria-pressed={active}
+      aria-label={`Sorter ${label.toLocaleLowerCase('nb-NO')}. Nå: ${direction}.`}
+      onClick={() => toggleMatchSort(match, key)}
+    ><span>{label}</span><SortIcon size={14} strokeWidth={2.5} /></button>;
   }
 
   function markDrop(event: DragEvent<HTMLElement>, id: string) {
@@ -2135,6 +2476,9 @@ export function OddsenTracker() {
     setFilters((current) => Object.fromEntries(
       Object.entries(current).filter(([storedMatch]) => remainingMatches.has(storedMatch)),
     ));
+    setSorts((current) => Object.fromEntries(
+      Object.entries(current).filter(([storedMatch]) => remainingMatches.has(storedMatch)),
+    ));
 
     if (draggedId && removedIds.has(draggedId)) endDrag();
     if (settlingId && removedIds.has(settlingId)) setSettlingId(null);
@@ -2163,17 +2507,20 @@ export function OddsenTracker() {
     setBets([]);
     setSelected(new Set());
     setFilters({});
+    setSorts({});
     endDrag();
     setSettlingId(null);
   }
 
   function resetImportSource() {
-    uploadFiles.forEach((item) => URL.revokeObjectURL(item.url));
+    uploadFiles.forEach((item) => releaseImportSourcePreview(item));
     setUploadFiles([]);
     nextSourceOrder.current = 0;
     setImportText('');
     setImportError('');
+    setImportWarning('');
     setOcrProgress(0);
+    setOcrFileProgress({ current: 0, total: 0 });
     setDetectedRegions(0);
   }
 
@@ -2187,6 +2534,7 @@ export function OddsenTracker() {
   }
 
   function closeImport() {
+    pendingAdditionalImport.current = null;
     resetImportSource();
     setDrafts([]);
     setAppendImport(false);
@@ -2200,12 +2548,8 @@ export function OddsenTracker() {
   }
 
   function beginAdditionalImport() {
-    const preserveCurrentDrafts = importStep === 'review';
-    resetImportSource();
-    if (!preserveCurrentDrafts) setDrafts([]);
-    setAppendImport(preserveCurrentDrafts);
-    setImportMode('image');
-    setImportStep('source');
+    pendingAdditionalImport.current = { preserveDrafts: importStep === 'review' };
+    if (imageInputRef.current) openImportFilePicker(imageInputRef.current);
   }
 
   function acceptImportedDrafts(items: ImportDraft[]) {
@@ -2216,16 +2560,40 @@ export function OddsenTracker() {
     setImportError('');
   }
 
-  function addFiles(files: FileList | File[]) {
-    const candidates = [...files].filter((file) => file.type.startsWith('image/') || /\.(?:png|jpe?g|webp)$/i.test(file.name));
-    if (!candidates.length) return setImportError('Velg PNG-, JPG- eller WEBP-bilder.');
-    setUploadFiles((all) => {
-      const images = candidates.slice(0, Math.max(0, 8 - all.length));
-      const prepared = createCanonicalImportSources(images, nextSourceOrder.current);
-      nextSourceOrder.current += prepared.length;
-      return [...all, ...prepared];
-    });
+  function addFiles(files: FileList | File[], replace = false) {
+    const selection = evaluateImportFileSelection([...files], replace ? 0 : uploadFiles.length);
+    if (selection.error) { setImportError(selection.error); return false; }
+    let prepared: ImportSource[];
+    try {
+      prepared = createCanonicalImportSources(selection.accepted, replace ? 0 : nextSourceOrder.current);
+    } catch (error) {
+      const previewError = withImportStage(error, 'preview', selection.accepted[0]?.name || 'bildet');
+      setImportError(getImportFailureMessage(previewError));
+      return false;
+    }
+    if (replace) {
+      uploadFiles.forEach((item) => releaseImportSourcePreview(item));
+      nextSourceOrder.current = 0;
+    }
+    nextSourceOrder.current += prepared.length;
+    setUploadFiles((all) => replace ? prepared : [...all, ...prepared]);
     setImportError('');
+    setImportWarning('');
+    return true;
+  }
+
+  function handleImageSelection(event: ChangeEvent<HTMLInputElement>) {
+    const files = readImportFileSelection(event.currentTarget);
+    const additional = pendingAdditionalImport.current;
+    pendingAdditionalImport.current = null;
+    if (!files.length) return;
+    if (!addFiles(files, Boolean(additional))) return;
+    if (additional) {
+      if (!additional.preserveDrafts) setDrafts([]);
+      setAppendImport(additional.preserveDrafts);
+      setImportMode('image');
+      setImportStep('source');
+    }
   }
 
   async function processSource() {
@@ -2235,15 +2603,28 @@ export function OddsenTracker() {
       acceptImportedDrafts(parsed); return;
     }
     if (!uploadFiles.length || ocrBusy) return setImportError('Legg til minst ett skjermbilde først.');
-    setOcrBusy(true); setImportError(''); setOcrProgress(0);
+    setOcrBusy(true); setImportError(''); setImportWarning(''); setOcrProgress(0);
+    setOcrFileProgress({ current: 1, total: uploadFiles.length });
     try {
       const result = await importCouponFiles(uploadFiles, {
         onProgress: setOcrProgress,
         onDetectedRegions: setDetectedRegions,
+        onFileProgress: (completed, total) => setOcrFileProgress({ current: Math.min(total, completed + 1), total }),
+        concurrency: importOcrConcurrency,
       });
+      if (result.failures.length) {
+        setImportError(`${result.failures.map((failure) => failure.message).join(' ')} Bildene er beholdt; trykk «Les skjermbilder» for å prøve igjen.`);
+        if (result.drafts.length) setImportWarning(`${result.drafts.length} spillvalg ble lest, men importen venter til alle valgte bilder er ferdigbehandlet.`);
+        return;
+      }
+      if (!result.drafts.length) return setImportError('Ingen kuponger ble funnet. Bildene er beholdt, slik at du kan prøve igjen.');
+      uploadFiles.forEach((source) => releaseImportSourcePreview(source));
+      setUploadFiles([]);
       acceptImportedDrafts(result.drafts);
     } catch (error) {
-      console.error(error); setImportError('Bildelesingen kunne ikke fullføres. Sjekk nettilgangen til OCR-språkdataene, eller bruk tekstimport.');
+      const failure = withImportStage(error, 'recognize', uploadFiles[0]?.file.name || 'bildet');
+      console.error('[coupon-import]', { stage: failure.stage, sourceName: failure.sourceName, error: failure.cause || failure });
+      setImportError(`${getImportFailureMessage(failure)} Bildene er beholdt; trykk «Les skjermbilder» for å prøve igjen.`);
     } finally { setOcrBusy(false); }
   }
 
@@ -2296,7 +2677,8 @@ export function OddsenTracker() {
         {bets.length > 0 && <>
           {matchGroups.map((group) => {
             const filter = filters[group.match] || 'Alle';
-            const visible = filter === 'Alle' ? group.bets : group.bets.filter((bet) => bet.category === filter);
+            const filtered = filter === 'Alle' ? group.bets : group.bets.filter((bet) => bet.category === filter);
+            const visible = sortBetsForDisplay(filtered, sorts[group.match]);
             const groupTotals = trackedSummary(group.bets);
             const groupChosen = group.bets.filter((bet) => selected.has(bet.id));
             const groupChosenSummary = trackedSummary(groupChosen);
@@ -2374,13 +2756,14 @@ export function OddsenTracker() {
                       );
                     })}
                   </div>
-                  <span className="sort-guide">
-                    <GripVertical size={18} strokeWidth={2.4} />
-                    <span>Dra for å sortere</span>
-                  </span>
                 </div>
-                <div className="bet-columns" aria-hidden="true">
-                  <span /><span>Marked og spillvalg</span><span>Odds</span><span>Innsats</span><span>Mulig premie</span><span />
+                <div className="bet-columns" aria-label={`Sorter spill for ${group.match}`}>
+                  <span className="sort-guide"><GripVertical size={16} strokeWidth={2.4} /><span>Dra for manuell rekkefølge</span></span>
+                  <span className="bet-description-column">Marked og spillvalg</span>
+                  {renderSortButton(group.match, 'odds', 'Odds')}
+                  {renderSortButton(group.match, 'stake', 'Innsats')}
+                  {renderSortButton(group.match, 'payout', 'Mulig premie')}
+                  <span className="bet-actions-column" />
                 </div>
                 <div className="bet-list" role="listbox" aria-label={`Spill for ${group.match}`} aria-multiselectable="true">
                   {visible.map((bet) => {
@@ -2472,14 +2855,16 @@ export function OddsenTracker() {
 
       {importOpen && <div className="modal-backdrop" role="presentation">
         <section className="import-dialog" role="dialog" aria-modal="true" aria-labelledby="import-title">
+          <input ref={imageInputRef} id="coupon-images" className="sr-only" type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={handleImageSelection} />
           <header className="import-header"><div><span className="section-kicker">{importStep === 'review' ? 'Kontroller før lagring' : importStep === 'success' ? 'Import fullført' : appendImport ? 'Utvid innlesningen' : 'Ny kupongimport'}</span><h2 id="import-title">{importStep === 'review' ? `${draftCouponCount} ${draftCouponCount === 1 ? 'kupong' : 'kuponger'} · ${drafts.length} spillvalg` : importStep === 'success' ? 'Kupongene er lagt til' : appendImport ? 'Importer flere kuponger' : 'Importer kupong'}</h2></div><button type="button" onClick={closeImport} aria-label="Lukk"><X /></button></header>
           {importStep === 'source' && <div className="import-body">
             <div className="import-tabs" role="tablist" aria-label="Velg importmetode"><button type="button" role="tab" aria-selected={importMode === 'image'} className={importMode === 'image' ? 'active' : ''} onClick={() => { setImportMode('image'); setImportError(''); }}><ImageIcon size={16} /> Skjermbilder</button><button type="button" role="tab" aria-selected={importMode === 'text'} className={importMode === 'text' ? 'active' : ''} onClick={() => { setImportMode('text'); setImportError(''); }}><FileText size={16} /> Kupongtekst</button></div>
-            {importMode === 'image' ? <><input id="coupon-images" className="sr-only" type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={(event: ChangeEvent<HTMLInputElement>) => { if (event.target.files) addFiles(event.target.files); event.currentTarget.value = ''; }} /><label className="dropzone" htmlFor="coupon-images" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles(event.dataTransfer.files); }}><Upload size={30} /><strong>Velg skjermbilder</strong><span>Trykk for å velge eller ta bilde · PNG, JPG eller WEBP · maks 8</span></label>{uploadFiles.length > 0 && <div className="image-queue">{uploadFiles.map((item) => <figure key={item.sourceId}><img src={item.url} alt={item.file.name} /><figcaption title={item.file.name}>{item.file.name}</figcaption><button type="button" onClick={() => { URL.revokeObjectURL(item.url); setUploadFiles((all) => all.filter((file) => file.sourceId !== item.sourceId)); }} aria-label={`Fjern ${item.file.name}`}><X size={14} /></button></figure>)}</div>}{ocrBusy && <div className="ocr-progress"><div><Loader2 className="spin" size={17} /><span>{detectedRegions ? `${detectedRegions} kupongområder funnet` : 'Deler bildet i kuponger'} · {Math.round(ocrProgress * 100)} %</span></div><i style={{ width: `${Math.round(ocrProgress * 100)}%` }} /></div>}</> : <label className="text-source">Kupongtekst<textarea value={importText} onChange={(event) => setImportText(event.target.value)} placeholder={'Lim inn én eller flere kvitteringer her…\n\nInnsats: 100,00\nOdds: 2.10\nMulig Premie: 210,00\n1. Norge v England\nStarttid: 11/7 23:00\nSpillobjekt: Scorer mål\nSpilt utfall: Erling Haaland'} /></label>}
+            {importMode === 'image' ? <><button type="button" className="dropzone" onClick={() => imageInputRef.current && openImportFilePicker(imageInputRef.current)} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles(event.dataTransfer.files); }}><Upload size={30} /><strong>{mobileImportEnvironment ? 'Velg eller ta skjermbilder' : 'Dra skjermbilder hit, eller klikk for å velge'}</strong><span>PNG, JPG eller WEBP · opptil {MAX_IMPORT_FILES} bilder</span></button>{uploadFiles.length > 0 && <p className="image-selection-count">{uploadFiles.length} av {MAX_IMPORT_FILES} bilder valgt</p>}{selectedFileWarning && <p className="import-warning"><CircleAlert size={16} />{selectedFileWarning}</p>}{uploadFiles.length > 0 && !ocrBusy && <div className="image-queue">{uploadFiles.map((item) => <figure key={item.sourceId}><img src={item.url} alt={item.file.name} onError={() => setImportError(getImportFailureMessage({ stage: 'preview', sourceName: item.file.name }))} /><figcaption title={item.file.name}>{item.file.name}</figcaption><button type="button" onClick={() => { releaseImportSourcePreview(item); setUploadFiles((all) => all.filter((file) => file.sourceId !== item.sourceId)); }} aria-label={`Fjern ${item.file.name}`}><X size={14} /></button></figure>)}</div>}{ocrBusy && <div className="ocr-progress"><div><Loader2 className="spin" size={17} /><span>Behandler bilde {ocrFileProgress.current} av {ocrFileProgress.total}{detectedRegions ? ` · ${detectedRegions} kupongområder funnet` : ''} · {Math.round(ocrProgress * 100)} %</span></div><i style={{ width: `${Math.round(ocrProgress * 100)}%` }} /></div>}</> : <label className="text-source">Kupongtekst<textarea value={importText} onChange={(event) => setImportText(event.target.value)} placeholder={'Lim inn én eller flere kvitteringer her…\n\nInnsats: 100,00\nOdds: 2.10\nMulig Premie: 210,00\n1. Norge v England\nStarttid: 11/7 23:00\nSpillobjekt: Scorer mål\nSpilt utfall: Erling Haaland'} /></label>}
+            {importWarning && <p className="import-warning"><CircleAlert size={16} />{importWarning}</p>}
             {importError && <p className="import-error">{importError}</p>}
           </div>}
           {importStep === 'review' && <div className="import-body review-body">
-            <div className="review-intro"><Check size={18} /><p><strong>{draftCouponCount} {draftCouponCount === 1 ? 'kupong' : 'kuponger'} med {drafts.length} spillvalg til kontroll.</strong> Røde kort må rettes før noe kan lagres.</p></div>
+            <div className={`review-intro is-${reviewStatus.tone}`}>{reviewStatus.tone === 'error' ? <CircleAlert size={18} /> : <Check size={18} />}<p><strong>{reviewStatus.message}</strong></p></div>
             <div className="review-list">{drafts.map((item, index) => {
               const errors = draftErrors(item);
               return <article className={`review-card ${errors.length ? 'is-invalid' : 'is-valid'}`} key={item.id}>
@@ -2489,6 +2874,7 @@ export function OddsenTracker() {
                 {errors.length > 0 && <ul className="review-errors">{errors.map((error) => <li key={error}>{error}</li>)}</ul>}
               </article>;
             })}</div>
+            {importWarning && <p className="import-warning"><CircleAlert size={16} />{importWarning}</p>}
             {importError && <p className="import-error">{importError}</p>}
           </div>}
           {importStep === 'success' && <div className="import-success"><span><Check /></span><h3>{importedCount} {importedCount === 1 ? 'kupong importert' : 'kuponger importert'}</h3><p>Spillene er lagret lokalt og vises nå i kampoversikten.</p></div>}
@@ -2500,7 +2886,7 @@ export function OddsenTracker() {
             </div>
             <div>
               {importStep === 'source' && (importMode === 'text' || uploadFiles.length > 0) && <button type="button" className="primary-button" disabled={ocrBusy} onClick={processSource}>{ocrBusy ? <Loader2 className="spin" size={17} /> : importMode === 'image' ? <ImageIcon size={17} /> : <FileText size={17} />}{ocrBusy ? 'Leser bilder' : importMode === 'image' ? 'Les skjermbilder' : 'Finn kuponger'}</button>}
-              {importStep === 'review' && <><button type="button" className="secondary-button" onClick={() => setDrafts((all) => [...all, draft()])}><Plus size={16} /> Legg til rad</button><button type="button" className="primary-button" disabled={!drafts.length || drafts.some((item) => draftErrors(item).length > 0)} onClick={commitImport} title={drafts.some((item) => draftErrors(item).length > 0) ? 'Rett kritiske feltfeil før lagring' : undefined}><Check size={17} /> Lagre kuponger</button></>}
+              {importStep === 'review' && <><button type="button" className="secondary-button" onClick={() => setDrafts((all) => [...all, draft()])}><Plus size={16} /> Legg til rad</button><button type="button" className="primary-button" disabled={!drafts.length || reviewStatus.invalidCardCount > 0} onClick={commitImport} title={reviewStatus.invalidCardCount > 0 ? 'Rett kritiske feltfeil før lagring' : undefined}><Check size={17} /> Lagre kuponger</button></>}
               {importStep === 'success' && <button type="button" className="primary-button" onClick={closeImport}>Ferdig</button>}
             </div>
           </footer>
