@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
+    "jpeg-js": "^0.4.4",
     "lucide-react": "latest",
     "react": "latest",
     "react-dom": "latest",
@@ -26,7 +27,6 @@
     "@types/react-dom": "latest",
     "eslint": "latest",
     "globals": "latest",
-    "jpeg-js": "^0.4.4",
     "typescript-eslint": "latest",
     "vitest": "latest"
   }

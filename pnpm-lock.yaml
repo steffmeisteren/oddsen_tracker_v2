@@ -11,6 +11,9 @@ importers:
       '@vitejs/plugin-react':
         specifier: latest
         version: 6.0.3(vite@8.1.4)
+      jpeg-js:
+        specifier: ^0.4.4
+        version: 0.4.4
       lucide-react:
         specifier: latest
         version: 1.24.0(react@19.2.7)
@@ -45,9 +48,6 @@ importers:
       globals:
         specifier: latest
         version: 17.7.0
-      jpeg-js:
-        specifier: ^0.4.4
-        version: 0.4.4
       typescript-eslint:
         specifier: latest
         version: 8.63.0(eslint@10.6.0)(typescript@7.0.2)
