@@ -1,0 +1,87 @@
+[
+  {
+    "file": "3132.jpg",
+    "originalFile": "Screenshot_20260714_153616.jpg",
+    "sha256": "2c9d5426c847cd6d9c24245f6c0905d49ca24e517fb8bf39e764b1d567448454",
+    "expected": {
+      "match": "Frankrike vs Spania",
+      "kickoff": "14.07.2026 21:00",
+      "competition": "Internasjonal - Fotball-VM",
+      "market": "Scorer mål",
+      "selection": "Kylian Mbappe",
+      "odds": "2.1",
+      "stake": "500",
+      "payout": "1050",
+      "coupon": "301648248.1",
+      "category": "Spiller"
+    }
+  },
+  {
+    "file": "3133.jpg",
+    "originalFile": "Screenshot_20260714_153622.jpg",
+    "sha256": "842b6b41e989d31568b2f5921bfaa70928577086aa1791196fea00a89ed51510",
+    "expected": {
+      "match": "Frankrike vs Spania",
+      "kickoff": "14.07.2026 21:00",
+      "competition": "Internasjonal - Fotball-VM",
+      "market": "Scorer 2 eller flere mål",
+      "selection": "Kylian Mbappe",
+      "odds": "7.5",
+      "stake": "100",
+      "payout": "750",
+      "coupon": "301648357.1",
+      "category": "Spiller"
+    }
+  },
+  {
+    "file": "3134.jpg",
+    "originalFile": "Screenshot_20260714_153631.jpg",
+    "sha256": "d0e7cfc3f4db4f9d75a9473c1bc62144021b5e59622a5272e3751e8bad59ac03",
+    "expected": {
+      "match": "Frankrike vs Spania",
+      "kickoff": "14.07.2026 21:00",
+      "competition": "Internasjonal - Fotball-VM",
+      "market": "Korrekt resultat",
+      "selection": "Frankrike 2 - 1",
+      "odds": "9.5",
+      "stake": "100",
+      "payout": "950",
+      "coupon": "301646869.1",
+      "category": "Resultat"
+    }
+  },
+  {
+    "file": "3135.jpg",
+    "originalFile": "Screenshot_20260714_153747.jpg",
+    "sha256": "0a10513a36208af0777b50854372388feda6adcdcbb547c3f766d18ee20127af",
+    "expected": {
+      "match": "Frankrike vs Spania",
+      "kickoff": "14.07.2026 21:00",
+      "competition": "Internasjonal - Fotball-VM",
+      "market": "Halvtid/Fulltid",
+      "selection": "Spain - France",
+      "odds": "25",
+      "stake": "200",
+      "payout": "5000",
+      "coupon": "301646585.1",
+      "category": "Resultat"
+    }
+  },
+  {
+    "file": "special-event-norway-world-cup.jpg",
+    "originalFile": "Screenshot_20260711_221654.jpg",
+    "sha256": "2e2bc0193e22e97de5f1347b18987dc3294cee1f289603ec6da4a56bfe4fde96",
+    "expected": {
+      "match": "Norges Fotball-VM 2026",
+      "kickoff": "08.07.2026 22:59",
+      "competition": "VM 2026 - Spesialer",
+      "market": "Vinner Norge VM? (kun singelspill)",
+      "selection": "Ja",
+      "odds": "17",
+      "stake": "300",
+      "payout": "5100",
+      "coupon": "299102132.1",
+      "category": "Spesial"
+    }
+  }
+]

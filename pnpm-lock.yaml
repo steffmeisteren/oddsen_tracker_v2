@@ -45,6 +45,9 @@ importers:
       globals:
         specifier: latest
         version: 17.7.0
+      jpeg-js:
+        specifier: ^0.4.4
+        version: 0.4.4
       typescript-eslint:
         specifier: latest
         version: 8.63.0(eslint@10.6.0)(typescript@7.0.2)
@@ -670,6 +673,9 @@ packages:
 
   isexe@2.0.0:
     resolution: {integrity: sha512-RHxMLp9lnKHGHRng9QFhRCMbYAcVpn69smSGcq3f36xjgVVWThj4qqLbTLlq7Ssj8B+fIQ1EuCEGI2lKsyQeIw==}
+
+  jpeg-js@0.4.4:
+    resolution: {integrity: sha512-WZzeDOEtTOBK4Mdsar0IqEU5sMr3vSV2RqkAIzUEV2BHnUfKGyswWFPFwK5EeDo93K3FohSHbLAjj0s1Wzd+dg==}
 
   json-buffer@3.0.1:
     resolution: {integrity: sha512-4bV5BfR2mqfQTJm+V5tPPdf+ZpuhiIvTuAB5g8kcrXOZpTT/QwwVRWBywX1ozr6lEuPdbHxwaJlm9G6mI2sfSQ==}
@@ -1583,6 +1589,8 @@ snapshots:
   is-url@1.2.4: {}
 
   isexe@2.0.0: {}
+
+  jpeg-js@0.4.4: {}
 
   json-buffer@3.0.1: {}
 
